@@ -47,7 +47,7 @@ PATIENT_IDS: Tuple[str, ...] = tuple(
     f"P{i}" for i in range(1, 25) if i not in EXCLUDED_PATIENTS
 )
 PACES: Tuple[str, ...] = ("NP", "SP", "FP")
-SUBTRIAL_NUMS: Tuple[str, ...] = tuple(str(i) for i in range(1, 11))  # "1" .. "10"
+TRIALS_PER_PERSON: int = 3             # First 3 valid trials per patient & pace (speed)
 
 # =============================================================================
 # 2. Verified Hardware, Geometry & Optimization Constants
@@ -101,9 +101,7 @@ class TrialData:
     pace: str                   # "NP", "SP", or "FP"
     t_left: np.ndarray          # Aligned timestamps (s), shape (T_L,)
     t_right: np.ndarray         # Aligned timestamps (s), shape (T_R,)
-    grid_left: np.ndarray       # Interpolated pressure (T_L, GRID_NY, GRID_NX), float32
-    grid_right: np.ndarray      # Interpolated pressure (T_R, GRID_NY, GRID_NX), float32
-    raw_left: np.ndarray        # Baseline-subtracted 32-sensor matrix (T_L, 32), float32
+    raw_left: np.ndarray       # Baseline-subtracted 32-sensor matrix (T_L, 32), float32
     raw_right: np.ndarray       # Baseline-subtracted 32-sensor matrix (T_R, 32), float32
     ground_truth: GroundTruth
 
@@ -120,6 +118,8 @@ class InsoleDataset:
     sensor_xy_right: np.ndarray # Canonical (32, 2) cm coords (mirrored to Left frame)
     outline_cm: np.ndarray      # Sampled (K, 2) cm contour for plotting
     insole_mask: np.ndarray     # Boolean (GRID_NY, GRID_NX) convex-hull mask
+    W_left: np.ndarray          # Interpolation weights (GRID_NY, GRID_NX, 32), float32
+    W_right: np.ndarray         # Interpolation weights (GRID_NY, GRID_NX, 32), float32
     trials: List[TrialData]
 
     @property
@@ -139,9 +139,9 @@ class InsoleDataset:
         accum = np.zeros((len(self.gy), len(self.gx)), dtype=np.float64)
         total_frames = 0
         for tr in subset:
-            accum += tr.grid_left.sum(axis=0, dtype=np.float64)
-            accum += tr.grid_right.sum(axis=0, dtype=np.float64)
-            total_frames += len(tr.grid_left) + len(tr.grid_right)
+            accum += np.maximum(tr.raw_left @ self.W_left.reshape(-1, 32).T, 0.0).sum(0).reshape(accum.shape)
+            accum += np.maximum(tr.raw_right @ self.W_right.reshape(-1, 32).T, 0.0).sum(0).reshape(accum.shape)
+            total_frames += len(tr.raw_left) + len(tr.raw_right)
         return accum / max(1, total_frames)
 
     def to_cache_dict(self) -> Dict[str, object]:
@@ -158,8 +158,6 @@ class InsoleDataset:
                 pace=tr["pace"],
                 t_left=tr["t_left"],
                 t_right=tr["t_right"],
-                grid_left=tr["grid_left"],
-                grid_right=tr["grid_right"],
                 raw_left=tr["raw_left"],
                 raw_right=tr["raw_right"],
                 ground_truth=GroundTruth(**tr["ground_truth"]),
@@ -176,6 +174,8 @@ class InsoleDataset:
             sensor_xy_right=payload["sensor_xy_right"],
             outline_cm=payload["outline_cm"],
             insole_mask=payload["insole_mask"],
+            W_left=payload["W_left"],
+            W_right=payload["W_right"],
             trials=trials,
         )
 
@@ -375,8 +375,10 @@ def build_rbf_projection(
     smoothing: float = RBF_SMOOTHING,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Precompute linear thin-plate spline weight matrix W of shape (NY*NX, 32)
-    so any (T, 32) trial projects onto the dense grid via one matrix multiply.
+    Precompute linear thin-plate spline weights W of shape (NY, NX, 32): the
+    interpolated pressure at grid cell (j, i) is P_32 @ W[j, i]. Because the
+    interpolation is linear, only W and the raw (T, 32) signals are cached —
+    never the dense (T, NY, NX) pressure grid.
     Points outside the 32-sensor convex hull are masked to 0.
     """
     GX, GY = np.meshgrid(gx, gy)
@@ -393,27 +395,26 @@ def build_rbf_projection(
     hull = Delaunay(sensor_xy)
     inside = hull.find_simplex(grid_pts) >= 0
     W[~inside, :] = 0.0
-    return W, inside.reshape(len(gy), len(gx))
-
-
-def project_to_grid(P_32: np.ndarray, W_grid: np.ndarray, ny: int, nx: int) -> np.ndarray:
-    """Project (T, 32) pressures onto non-negative (T, NY, NX) float32 grid."""
-    grid = (P_32 @ W_grid.T).reshape(-1, ny, nx)
-    np.maximum(grid, 0.0, out=grid)
-    return grid
+    shape = (len(gy), len(gx))
+    return W.reshape(*shape, NUM_REAL_SENSORS), inside.reshape(shape)
 
 
 # =============================================================================
 # 7. Virtual Sensor Sampling, Event Detection & Layout Scoring
 # =============================================================================
 def sample_virtual_sensors(
-    grid: np.ndarray,
+    P_32: np.ndarray,
+    W: np.ndarray,
     sensor_xy: np.ndarray,
     gx: np.ndarray,
     gy: np.ndarray,
 ) -> np.ndarray:
-    """Vectorized bilinear interpolation of N continuous sensors; returns summed (T,) signal."""
-    ny, nx = grid.shape[1], grid.shape[2]
+    """
+    Bilinearly interpolate the (NY, NX, 32) weight grid at N continuous sensor
+    positions, apply them to the raw (T, 32) pressures, and return the summed
+    (T,) virtual-insole signal (each virtual sensor clipped at 0).
+    """
+    ny, nx = W.shape[0], W.shape[1]
     dx = gx[1] - gx[0]
     dy = gy[1] - gy[0]
 
@@ -422,16 +423,16 @@ def sample_virtual_sensors(
 
     x0 = ix.astype(np.int32)
     y0 = iy.astype(np.int32)
-    wx = (ix - x0).astype(np.float32)
-    wy = (iy - y0).astype(np.float32)
+    wx = (ix - x0).astype(np.float32)[:, None]
+    wy = (iy - y0).astype(np.float32)[:, None]
 
-    vals = (
-        (1.0 - wy) * (1.0 - wx) * grid[:, y0, x0]
-        + (1.0 - wy) * wx * grid[:, y0, x0 + 1]
-        + wy * (1.0 - wx) * grid[:, y0 + 1, x0]
-        + wy * wx * grid[:, y0 + 1, x0 + 1]
+    w_sensors = (                                       # (N, 32)
+        (1.0 - wy) * (1.0 - wx) * W[y0, x0]
+        + (1.0 - wy) * wx * W[y0, x0 + 1]
+        + wy * (1.0 - wx) * W[y0 + 1, x0]
+        + wy * wx * W[y0 + 1, x0 + 1]
     )
-    return vals.sum(axis=1)
+    return np.maximum(P_32 @ w_sensors.T, 0.0).sum(axis=1)
 
 
 def detect_hs_to(
@@ -551,12 +552,12 @@ def check_constraints(
 def score_trial(
     sensor_xy: np.ndarray,
     trial: TrialData,
-    gx: np.ndarray,
-    gy: np.ndarray,
+    dataset: InsoleDataset,
 ) -> Dict[str, float]:
     """Compute HS, TO, Step, Stride RMSEs and combined E(X) (ms) for one trial."""
-    sig_L = sample_virtual_sensors(trial.grid_left, sensor_xy, gx, gy)
-    sig_R = sample_virtual_sensors(trial.grid_right, sensor_xy, gx, gy)
+    gx, gy = dataset.gx, dataset.gy
+    sig_L = sample_virtual_sensors(trial.raw_left, dataset.W_left, sensor_xy, gx, gy)
+    sig_R = sample_virtual_sensors(trial.raw_right, dataset.W_right, sensor_xy, gx, gy)
 
     hs_L, to_L = detect_hs_to(trial.t_left, sig_L)
     hs_R, to_R = detect_hs_to(trial.t_right, sig_R)
@@ -615,7 +616,7 @@ def score_layout(
     if not target_trials:
         raise ValueError("No trials provided to score_layout().")
 
-    e_vals = [score_trial(sensor_xy, tr, dataset.gx, dataset.gy)["E_ms"] for tr in target_trials]
+    e_vals = [score_trial(sensor_xy, tr, dataset)["E_ms"] for tr in target_trials]
     total = float(np.mean(e_vals))
     if include_overlap_penalty:
         total += overlap_penalty(sensor_xy, sensor_radius_cm=dataset.sensor_radius_cm)
@@ -629,12 +630,13 @@ def discover_trials(
     dataset_dir: str | Path = DATASET_DIR,
     patient_ids: Sequence[str] = PATIENT_IDS,
     paces: Sequence[str] = PACES,
-    subtrial_nums: Sequence[str | int] = SUBTRIAL_NUMS,
+    trials_per_person: int = TRIALS_PER_PERSON,
 ) -> List[Dict[str, str | Path]]:
     """
     Discover walking trials under:
-        411Optimization/insole-gaitrite-dataset/P{i}/{pace}/{1..10}/
-    Expects L.csv, R.csv, gaitrite_test.csv, and sync_auto.json in each subtrial folder.
+        411Optimization/insole-gaitrite-dataset/P{i}/{pace}/{1,2,...}/
+    Keeps the first `trials_per_person` (numerically sorted) subtrial folders per
+    patient & pace that contain L.csv, R.csv, gaitrite_test.csv, and sync_auto.json.
     """
     root = Path(dataset_dir)
     specs: List[Dict[str, str | Path]] = []
@@ -645,11 +647,15 @@ def discover_trials(
             if not pace_dir.is_dir():
                 continue
 
-            for sub in subtrial_nums:
-                folder = pace_dir / str(sub)
-                if not folder.is_dir():
-                    continue
-
+            subfolders = sorted(
+                (d for d in pace_dir.iterdir() if d.is_dir() and d.name.isdigit()),
+                key=lambda d: int(d.name),
+            )
+            kept = 0
+            for folder in subfolders:
+                if kept >= trials_per_person:
+                    break
+                sub = folder.name
                 l_csv = folder / "L.csv"
                 r_csv = folder / "R.csv"
                 gr_csv = folder / "gaitrite_test.csv"
@@ -667,11 +673,12 @@ def discover_trials(
                     "gaitrite_csv": gr_csv,
                     "sync_json": sync_file,
                 })
+                kept += 1
 
     if not specs:
         raise FileNotFoundError(
             f"No valid trials found under {root}. Expected "
-            "P1..P24/{NP,SP,FP}/{1..10}/ containing L.csv, R.csv, "
+            "P1..P24/{NP,SP,FP}/{1,2,...}/ containing L.csv, R.csv, "
             "gaitrite_test.csv, and sync_auto.json."
         )
     return specs
@@ -718,8 +725,6 @@ def build_dataset(
                 pace=str(spec["pace"]),
                 t_left=t_L,
                 t_right=t_R,
-                grid_left=project_to_grid(P_L, W_L, GRID_NY, GRID_NX),
-                grid_right=project_to_grid(P_R, W_R, GRID_NY, GRID_NX),
                 raw_left=P_L,
                 raw_right=P_R,
                 ground_truth=gt,
@@ -736,6 +741,8 @@ def build_dataset(
         sensor_xy_right=xy_R,
         outline_cm=outline_cm,
         insole_mask=insole_mask,
+        W_left=W_L,
+        W_right=W_R,
         trials=trials,
     )
 
