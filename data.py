@@ -12,9 +12,9 @@ Expected directory layout:
         ├── sensors_map_left.svg
         ├── sensors_map_right.svg
         ├── P1/
-        │   ├── NP/ (L.csv, R.csv, gaitrite_test.csv, sync_auto.json)
-        │   ├── SP/ ...
-        │   └── FP/ ...
+        │   ├── NP/1/ (L.csv, R.csv, gaitrite_test.csv, sync_auto.json)
+        │   ├── SP/1/ ...
+        │   └── FP/1/ ...
         └── ... P24/ (excluding P18, P22)
 """
 
@@ -31,6 +31,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 from scipy.interpolate import RBFInterpolator
+from scipy.ndimage import convolve
 from scipy.spatial import Delaunay
 
 # =============================================================================
@@ -47,7 +48,7 @@ PATIENT_IDS: Tuple[str, ...] = tuple(
     f"P{i}" for i in range(1, 25) if i not in EXCLUDED_PATIENTS
 )
 PACES: Tuple[str, ...] = ("NP", "SP", "FP")
-TRIALS_PER_PERSON: int = 3             # First 3 valid trials per patient & pace (speed)
+TRIALS_PER_PERSON: int = 3             # First 3 valid trials per patient & pace
 
 # =============================================================================
 # 2. Verified Hardware, Geometry & Optimization Constants
@@ -56,10 +57,23 @@ FS_HZ: float = 64.0                    # Insole sampling frequency (Hz)
 NUM_REAL_SENSORS: int = 32             # PressureSensor 0 .. 31
 PX_PER_CM: float = 96.0 / 2.54         # Inkscape 96 DPI (1:1 CAD mm scale)
 
-# Exact geometry parsed from sensors_map_left.svg / sensors_map_right.svg
+# Exact insole silhouette parsed from sensors_map_left.svg / sensors_map_right.svg
 INSOLE_WIDTH_CM: float = 8.933         # w (cm) — outer Bezier silhouette width
 INSOLE_LENGTH_CM: float = 27.540       # l (cm) — outer Bezier silhouette length
-SENSOR_RADIUS_CM: float = 0.840        # r (cm) — 31.74799 px (16.80 mm diameter)
+
+# Dataset physical pad dimensions (from CAD SVGs: 16.80 mm diameter)
+DATASET_SENSOR_RADIUS_CM: float = 0.840
+
+# Target virtual sensor dimensions (e.g., Interlink FSR 402):
+#   - Outer housing diameter = 18.30 mm -> r_outer  = 0.915 cm (bounds & non-overlap)
+#   - Active sensing diameter = 14.68 mm -> r_active = 0.734 cm (centered sensing area)
+SENSOR_OUTER_DIAMETER_MM: float = 18.30
+SENSOR_ACTIVE_DIAMETER_MM: float = 14.68
+SENSOR_OUTER_RADIUS_CM: float = (SENSOR_OUTER_DIAMETER_MM / 2.0) / 10.0   # 0.915 cm
+SENSOR_ACTIVE_RADIUS_CM: float = (SENSOR_ACTIVE_DIAMETER_MM / 2.0) / 10.0 # 0.734 cm
+
+# Alias kept for compatibility with optimize.py (positioning constraint radius)
+SENSOR_RADIUS_CM: float = SENSOR_OUTER_RADIUS_CM
 
 # Discrete sensor-count constraint: N in Z, 2 <= N <= 16
 N_MIN: int = 2
@@ -101,7 +115,7 @@ class TrialData:
     pace: str                   # "NP", "SP", or "FP"
     t_left: np.ndarray          # Aligned timestamps (s), shape (T_L,)
     t_right: np.ndarray         # Aligned timestamps (s), shape (T_R,)
-    raw_left: np.ndarray       # Baseline-subtracted 32-sensor matrix (T_L, 32), float32
+    raw_left: np.ndarray        # Baseline-subtracted 32-sensor matrix (T_L, 32), float32
     raw_right: np.ndarray       # Baseline-subtracted 32-sensor matrix (T_R, 32), float32
     ground_truth: GroundTruth
 
@@ -113,7 +127,9 @@ class InsoleDataset:
     gy: np.ndarray              # 1D y-grid coordinates (cm), shape (GRID_NY,)
     width_cm: float             # Exact w (8.933 cm)
     length_cm: float            # Exact l (27.540 cm)
-    sensor_radius_cm: float     # Exact r (0.840 cm)
+    sensor_radius_cm: float     # Outer package radius r_outer (0.915 cm) for constraints
+    active_radius_cm: float     # Centered active sensing radius r_active (0.734 cm)
+    dataset_radius_cm: float    # True dataset CAD pad radius r_ref (0.840 cm)
     sensor_xy_left: np.ndarray  # Canonical (32, 2) cm coords for Left insole
     sensor_xy_right: np.ndarray # Canonical (32, 2) cm coords (mirrored to Left frame)
     outline_cm: np.ndarray      # Sampled (K, 2) cm contour for plotting
@@ -124,7 +140,7 @@ class InsoleDataset:
 
     @property
     def bounds(self) -> Tuple[Tuple[float, float], Tuple[float, float]]:
-        """Box bounds [r, w - r] and [r, l - r] for optimizer clamping."""
+        """Box bounds [r_outer, w - r_outer] and [r_outer, l - r_outer] for clamping."""
         r = self.sensor_radius_cm
         return (r, self.width_cm - r), (r, self.length_cm - r)
 
@@ -138,9 +154,11 @@ class InsoleDataset:
         subset = self.get_trials_by_pace(pace) or self.trials
         accum = np.zeros((len(self.gy), len(self.gx)), dtype=np.float64)
         total_frames = 0
+        W_L_flat = self.W_left.reshape(-1, NUM_REAL_SENSORS).T
+        W_R_flat = self.W_right.reshape(-1, NUM_REAL_SENSORS).T
         for tr in subset:
-            accum += np.maximum(tr.raw_left @ self.W_left.reshape(-1, 32).T, 0.0).sum(0).reshape(accum.shape)
-            accum += np.maximum(tr.raw_right @ self.W_right.reshape(-1, 32).T, 0.0).sum(0).reshape(accum.shape)
+            accum += np.maximum(tr.raw_left @ W_L_flat, 0.0).sum(0).reshape(accum.shape)
+            accum += np.maximum(tr.raw_right @ W_R_flat, 0.0).sum(0).reshape(accum.shape)
             total_frames += len(tr.raw_left) + len(tr.raw_right)
         return accum / max(1, total_frames)
 
@@ -170,6 +188,8 @@ class InsoleDataset:
             width_cm=payload["width_cm"],
             length_cm=payload["length_cm"],
             sensor_radius_cm=payload["sensor_radius_cm"],
+            active_radius_cm=payload.get("active_radius_cm", SENSOR_ACTIVE_RADIUS_CM),
+            dataset_radius_cm=payload.get("dataset_radius_cm", DATASET_SENSOR_RADIUS_CM),
             sensor_xy_left=payload["sensor_xy_left"],
             sensor_xy_right=payload["sensor_xy_right"],
             outline_cm=payload["outline_cm"],
@@ -211,7 +231,7 @@ def parse_sensors_svg(
 ) -> Tuple[np.ndarray, np.ndarray, float, float, float]:
     """
     Parse sensors_map_left.svg or sensors_map_right.svg exported from Inkscape/DXF.
-    Returns (xy_cm, outline_cm, width_cm, length_cm, radius_cm) in canonical cm:
+    Returns (xy_cm, outline_cm, width_cm, length_cm, dataset_radius_cm) in canonical cm:
       - x in [0, width_cm]  (lateral -> medial on Left; mirrored for Right)
       - y in [0, length_cm] (0 = heel, length_cm = toe)
     """
@@ -366,19 +386,51 @@ def load_insole_csv(
 
 
 # =============================================================================
-# 6. Precompute Continuous Pressure Grid (Fast Matrix-RBF)
+# 6. Precompute Continuous Weight Grid (Fast Matrix-RBF + Active Disk Kernel)
 # =============================================================================
+def build_active_disk_kernel(
+    r_active_cm: float,
+    r_dataset_cm: float,
+    dx_cm: float,
+    dy_cm: float,
+) -> Optional[np.ndarray]:
+    """
+    Build a normalized 2D circular averaging kernel for the incremental sensing
+    footprint r_eff = sqrt(r_active^2 - r_dataset^2).
+
+    Returns None whenever r_active_cm <= r_dataset_cm (for our 14.68 mm active
+    diameter, r_active = 0.734 cm < r_dataset = 0.840 cm, so the dataset pads
+    already integrate over at least the active sensing area and no extra
+    spatial blur should be applied).
+    """
+    if r_active_cm <= r_dataset_cm + 1e-6:
+        return None
+    r_eff = float(np.sqrt(r_active_cm**2 - r_dataset_cm**2))
+    rx = max(1, int(np.ceil(r_eff / dx_cm)))
+    ry = max(1, int(np.ceil(r_eff / dy_cm)))
+    KX, KY = np.meshgrid(np.arange(-rx, rx + 1) * dx_cm, np.arange(-ry, ry + 1) * dy_cm)
+    mask = (KX**2 + KY**2) <= r_eff**2
+    if not np.any(mask):
+        return None
+    kernel = mask.astype(np.float32)
+    return kernel / kernel.sum()
+
+
 def build_rbf_projection(
     sensor_xy: np.ndarray,
     gx: np.ndarray,
     gy: np.ndarray,
+    r_active_cm: float = SENSOR_ACTIVE_RADIUS_CM,
+    r_dataset_cm: float = DATASET_SENSOR_RADIUS_CM,
     smoothing: float = RBF_SMOOTHING,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Precompute linear thin-plate spline weights W of shape (NY, NX, 32): the
-    interpolated pressure at grid cell (j, i) is P_32 @ W[j, i]. Because the
-    interpolation is linear, only W and the raw (T, 32) signals are cached —
-    never the dense (T, NY, NX) pressure grid.
+    interpolated pressure at grid cell (j, i) is P_32 @ W[j, i].
+
+    If r_active_cm > r_dataset_cm, W is convolved once along its spatial axes
+    with the incremental circular disk kernel so every grid lookup automatically
+    integrates over the larger active sensing area at zero extra runtime cost.
     Points outside the 32-sensor convex hull are masked to 0.
     """
     GX, GY = np.meshgrid(gx, gy)
@@ -395,8 +447,20 @@ def build_rbf_projection(
     hull = Delaunay(sensor_xy)
     inside = hull.find_simplex(grid_pts) >= 0
     W[~inside, :] = 0.0
+
     shape = (len(gy), len(gx))
-    return W.reshape(*shape, NUM_REAL_SENSORS), inside.reshape(shape)
+    W_3d = W.reshape(*shape, NUM_REAL_SENSORS)
+
+    disk_kernel = build_active_disk_kernel(
+        r_active_cm=r_active_cm,
+        r_dataset_cm=r_dataset_cm,
+        dx_cm=float(gx[1] - gx[0]),
+        dy_cm=float(gy[1] - gy[0]),
+    )
+    if disk_kernel is not None:
+        W_3d = convolve(W_3d, disk_kernel[:, :, None], mode="constant", cval=0.0)
+
+    return W_3d, inside.reshape(shape)
 
 
 # =============================================================================
@@ -411,7 +475,7 @@ def sample_virtual_sensors(
 ) -> np.ndarray:
     """
     Bilinearly interpolate the (NY, NX, 32) weight grid at N continuous sensor
-    positions, apply them to the raw (T, 32) pressures, and return the summed
+    centers, apply them to the raw (T, 32) pressures, and return the summed
     (T,) virtual-insole signal (each virtual sensor clipped at 0).
     """
     ny, nx = W.shape[0], W.shape[1]
@@ -494,75 +558,17 @@ def _match_nearest(
     return np.nan, miss_penalty
 
 
-def overlap_penalty(
-    sensor_xy: np.ndarray,
-    sensor_radius_cm: float = SENSOR_RADIUS_CM,
-    penalty_weight: float = OVERLAP_LAMBDA,
-) -> float:
-    """
-    Smooth quadratic exterior penalty enforcing non-overlap:
-        (2r)^2 - [(x_a - x_b)^2 + (y_a - y_b)^2] < 0   for 1 <= a < b <= N
-    """
-    n = len(sensor_xy)
-    if n < 2:
-        return 0.0
-    diff = sensor_xy[:, None, :] - sensor_xy[None, :, :]
-    dist_sq = np.sum(diff * diff, axis=-1)
-    iu = np.triu_indices(n, k=1)
-    violations = np.maximum(0.0, (2.0 * sensor_radius_cm) ** 2 - dist_sq[iu])
-    return float(penalty_weight * np.sum(violations ** 2))
-
-
-def check_constraints(
-    sensor_xy: np.ndarray,
-    width_cm: float = INSOLE_WIDTH_CM,
-    length_cm: float = INSOLE_LENGTH_CM,
-    sensor_radius_cm: float = SENSOR_RADIUS_CM,
-) -> Dict[str, float | bool]:
-    """Verify all mathematical programming constraints on a final sensor layout."""
-    xy = np.asarray(sensor_xy, dtype=np.float64).reshape(-1, 2)
-    n = len(xy)
-    r = sensor_radius_cm
-
-    in_bounds = bool(
-        np.all(xy[:, 0] >= r - 1e-9)
-        and np.all(xy[:, 0] <= width_cm - r + 1e-9)
-        and np.all(xy[:, 1] >= r - 1e-9)
-        and np.all(xy[:, 1] <= length_cm - r + 1e-9)
-    )
-    if n >= 2:
-        diff = xy[:, None, :] - xy[None, :, :]
-        dmat = np.linalg.norm(diff, axis=-1)
-        np.fill_diagonal(dmat, np.inf)
-        min_dist = float(dmat.min())
-    else:
-        min_dist = float("inf")
-
-    no_overlap = bool(min_dist >= 2.0 * r - 1e-9)
-    valid_n = bool(N_MIN <= n <= N_MAX)
-    return {
-        "feasible": valid_n and in_bounds and no_overlap,
-        "valid_N": valid_n,
-        "in_bounds": in_bounds,
-        "no_overlap": no_overlap,
-        "min_center_dist_cm": min_dist,
-    }
-
-
-def score_trial(
-    sensor_xy: np.ndarray,
-    trial: TrialData,
-    dataset: InsoleDataset,
+def _evaluate_signals(
+    t_left: np.ndarray,
+    sig_left: np.ndarray,
+    t_right: np.ndarray,
+    sig_right: np.ndarray,
+    gt: GroundTruth,
 ) -> Dict[str, float]:
-    """Compute HS, TO, Step, Stride RMSEs and combined E(X) (ms) for one trial."""
-    gx, gy = dataset.gx, dataset.gy
-    sig_L = sample_virtual_sensors(trial.raw_left, dataset.W_left, sensor_xy, gx, gy)
-    sig_R = sample_virtual_sensors(trial.raw_right, dataset.W_right, sensor_xy, gx, gy)
+    """Shared scorer comparing left/right summed pressure signals to GAITRite truth."""
+    hs_L, to_L = detect_hs_to(t_left, sig_left)
+    hs_R, to_R = detect_hs_to(t_right, sig_right)
 
-    hs_L, to_L = detect_hs_to(trial.t_left, sig_L)
-    hs_R, to_R = detect_hs_to(trial.t_right, sig_R)
-
-    gt = trial.ground_truth
     m = len(gt.foot)
     est_hs = np.full(m, np.nan, dtype=np.float64)
     hs_errs, to_errs, step_errs, stride_errs = [], [], [], []
@@ -601,6 +607,102 @@ def score_trial(
     }
 
 
+def overlap_penalty(
+    sensor_xy: np.ndarray,
+    sensor_radius_cm: float = SENSOR_OUTER_RADIUS_CM,
+    penalty_weight: float = OVERLAP_LAMBDA,
+) -> float:
+    """
+    Smooth quadratic exterior penalty enforcing physical package non-overlap:
+        (2 * r_outer)^2 - [(x_a - x_b)^2 + (y_a - y_b)^2] < 0   for 1 <= a < b <= N
+    Uses outer diameter (18.30 mm -> r_outer = 0.915 cm) so sensor housings
+    cannot physically overlap or touch.
+    """
+    n = len(sensor_xy)
+    if n < 2:
+        return 0.0
+    diff = sensor_xy[:, None, :] - sensor_xy[None, :, :]
+    dist_sq = np.sum(diff * diff, axis=-1)
+    iu = np.triu_indices(n, k=1)
+    violations = np.maximum(0.0, (2.0 * sensor_radius_cm) ** 2 - dist_sq[iu])
+    return float(penalty_weight * np.sum(violations ** 2))
+
+
+def check_constraints(
+    sensor_xy: np.ndarray,
+    width_cm: float = INSOLE_WIDTH_CM,
+    length_cm: float = INSOLE_LENGTH_CM,
+    sensor_radius_cm: float = SENSOR_OUTER_RADIUS_CM,
+) -> Dict[str, float | bool]:
+    """Verify all mathematical programming constraints on a candidate sensor layout."""
+    xy = np.asarray(sensor_xy, dtype=np.float64).reshape(-1, 2)
+    n = len(xy)
+    r = sensor_radius_cm
+
+    in_bounds = bool(
+        np.all(xy[:, 0] >= r - 1e-9)
+        and np.all(xy[:, 0] <= width_cm - r + 1e-9)
+        and np.all(xy[:, 1] >= r - 1e-9)
+        and np.all(xy[:, 1] <= length_cm - r + 1e-9)
+    )
+    if n >= 2:
+        diff = xy[:, None, :] - xy[None, :, :]
+        dmat = np.linalg.norm(diff, axis=-1)
+        np.fill_diagonal(dmat, np.inf)
+        min_dist = float(dmat.min())
+    else:
+        min_dist = float("inf")
+
+    no_overlap = bool(min_dist >= 2.0 * r - 1e-9)
+    valid_n = bool(N_MIN <= n <= N_MAX)
+    return {
+        "feasible": valid_n and in_bounds and no_overlap,
+        "valid_N": valid_n,
+        "in_bounds": in_bounds,
+        "no_overlap": no_overlap,
+        "min_center_dist_cm": min_dist,
+        "required_min_dist_cm": 2.0 * r,
+    }
+
+
+def score_trial(
+    sensor_xy: np.ndarray,
+    trial: TrialData,
+    dataset: InsoleDataset,
+) -> Dict[str, float]:
+    """Compute HS, TO, Step, Stride RMSEs and combined E(X) (ms) for a virtual layout."""
+    gx, gy = dataset.gx, dataset.gy
+    sig_L = sample_virtual_sensors(trial.raw_left, dataset.W_left, sensor_xy, gx, gy)
+    sig_R = sample_virtual_sensors(trial.raw_right, dataset.W_right, sensor_xy, gx, gy)
+    return _evaluate_signals(trial.t_left, sig_L, trial.t_right, sig_R, trial.ground_truth)
+
+
+def score_raw_trial(trial: TrialData) -> Dict[str, float]:
+    """
+    Score the true, unmodified 32-sensor dataset (native 16.80 mm pads, zero
+    spatial interpolation or kernel smoothing) directly against GAITRite truth.
+    """
+    sig_L = trial.raw_left.sum(axis=1)
+    sig_R = trial.raw_right.sum(axis=1)
+    return _evaluate_signals(trial.t_left, sig_L, trial.t_right, sig_R, trial.ground_truth)
+
+
+def score_raw_baseline(
+    dataset: InsoleDataset,
+    trials: Optional[Sequence[TrialData]] = None,
+) -> Dict[str, float]:
+    """
+    Average RMSE metrics across trials for the true unmodified 32-sensor hardware.
+    Use this as the clinical reference baseline when evaluating sparse layouts.
+    """
+    target_trials = trials if trials is not None else dataset.trials
+    if not target_trials:
+        raise ValueError("No trials provided to score_raw_baseline().")
+    per_trial = [score_raw_trial(tr) for tr in target_trials]
+    keys = ("E_ms", "HS_ms", "TO_ms", "Step_ms", "Stride_ms")
+    return {k: float(np.mean([res[k] for res in per_trial])) for k in keys}
+
+
 def score_layout(
     sensor_xy: np.ndarray,
     dataset: InsoleDataset,
@@ -609,7 +711,7 @@ def score_layout(
 ) -> float:
     """
     Main objective entry point for MOPSO, PSO, and SLSQP in optimize.py.
-    Returns mean E(X) (ms) over target trials plus optional overlap penalty.
+    Returns mean E(X) (ms) over target trials plus optional outer-package overlap penalty.
     """
     sensor_xy = np.asarray(sensor_xy, dtype=np.float64).reshape(-1, 2)
     target_trials = trials if trials is not None else dataset.trials
@@ -691,9 +793,13 @@ def build_dataset(
     cache_path: str | Path = CACHE_PATH,
     patient_ids: Sequence[str] = PATIENT_IDS,
     paces: Sequence[str] = PACES,
+    outer_radius_cm: float = SENSOR_OUTER_RADIUS_CM,
+    active_radius_cm: float = SENSOR_ACTIVE_RADIUS_CM,
 ) -> InsoleDataset:
     """Preprocess all discovered patient trials once and save to cache_path."""
-    xy_L, outline_cm, width_cm, length_cm, radius_cm = parse_sensors_svg(svg_left, mirror_x=False)
+    xy_L, outline_cm, width_cm, length_cm, dataset_radius_cm = parse_sensors_svg(
+        svg_left, mirror_x=False
+    )
     xy_R, _, w_R, l_R, _ = parse_sensors_svg(svg_right, mirror_x=True)
 
     if abs(width_cm - w_R) > 0.05 or abs(length_cm - l_R) > 0.05:
@@ -704,8 +810,12 @@ def build_dataset(
     gx = np.linspace(0.0, width_cm, GRID_NX)
     gy = np.linspace(0.0, length_cm, GRID_NY)
 
-    W_L, mask_L = build_rbf_projection(xy_L, gx, gy)
-    W_R, mask_R = build_rbf_projection(xy_R, gx, gy)
+    W_L, mask_L = build_rbf_projection(
+        xy_L, gx, gy, r_active_cm=active_radius_cm, r_dataset_cm=dataset_radius_cm
+    )
+    W_R, mask_R = build_rbf_projection(
+        xy_R, gx, gy, r_active_cm=active_radius_cm, r_dataset_cm=dataset_radius_cm
+    )
     insole_mask = mask_L | mask_R
 
     trial_specs = discover_trials(dataset_dir, patient_ids=patient_ids, paces=paces)
@@ -736,7 +846,9 @@ def build_dataset(
         gy=gy,
         width_cm=width_cm,
         length_cm=length_cm,
-        sensor_radius_cm=radius_cm,
+        sensor_radius_cm=outer_radius_cm,
+        active_radius_cm=active_radius_cm,
+        dataset_radius_cm=dataset_radius_cm,
         sensor_xy_left=xy_L,
         sensor_xy_right=xy_R,
         outline_cm=outline_cm,
@@ -771,11 +883,25 @@ def load_cached_dataset(cache_path: str | Path = CACHE_PATH) -> InsoleDataset:
 if __name__ == "__main__":
     ds = build_dataset()
     print(
-        f"Insole: w={ds.width_cm:.3f} cm, l={ds.length_cm:.3f} cm, "
-        f"r={ds.sensor_radius_cm:.3f} cm | bounds={ds.bounds}"
+        f"Insole: w={ds.width_cm:.3f} cm, l={ds.length_cm:.3f} cm | "
+        f"target outer r={ds.sensor_radius_cm:.3f} cm (D={20*ds.sensor_radius_cm:.2f} mm), "
+        f"active r={ds.active_radius_cm:.3f} cm (D={20*ds.active_radius_cm:.2f} mm) | "
+        f"dataset pad r={ds.dataset_radius_cm:.3f} cm (D={20*ds.dataset_radius_cm:.2f} mm)"
+    )
+    print(
+        f"Positioning box bounds: x in [{ds.bounds[0][0]:.3f}, {ds.bounds[0][1]:.3f}] cm, "
+        f"y in [{ds.bounds[1][0]:.3f}, {ds.bounds[1][1]:.3f}] cm"
     )
     np_trials = ds.get_trials_by_pace("NP")
     if np_trials:
-        e_32 = score_layout(ds.sensor_xy_left, ds, trials=np_trials, include_overlap_penalty=False)
-        print(f"32-sensor baseline mean E(X) on {len(np_trials)} NP trial(s): {e_32:.2f} ms")
-        print("Constraint check on 32 real sensors:", check_constraints(ds.sensor_xy_left))
+        raw_base = score_raw_baseline(ds, trials=np_trials)
+        print(
+            f"Unmodified 32-sensor baseline on {len(np_trials)} NP trial(s): "
+            f"E={raw_base['E_ms']:.2f} ms "
+            f"(HS={raw_base['HS_ms']:.2f}, TO={raw_base['TO_ms']:.2f}, "
+            f"Step={raw_base['Step_ms']:.2f}, Stride={raw_base['Stride_ms']:.2f})"
+        )
+        print(
+            "Dataset 32-sensor hardware geometry check:",
+            check_constraints(ds.sensor_xy_left, sensor_radius_cm=ds.dataset_radius_cm),
+        )
