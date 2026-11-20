@@ -1,0 +1,30 @@
+{
+  "L": {
+    "offset_seconds": -1.28125,
+    "intervals": [
+      968111,
+      960550,
+      989246
+    ],
+    "intervals_max": [
+      968111,
+      960550,
+      989246
+    ],
+    "total": 2917907,
+    "total_max": 2917907
+  },
+  "R": {
+    "offset_seconds": -1.25,
+    "intervals": [
+      1182344,
+      1215868
+    ],
+    "intervals_max": [
+      1182344,
+      1215868
+    ],
+    "total": 2398212,
+    "total_max": 2398212
+  }
+}
