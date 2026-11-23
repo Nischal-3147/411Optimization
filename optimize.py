@@ -1,6 +1,6 @@
 """
 optimize.py — Optimizers and report outputs for Smart Insole Sensor Placement
-(BME 411, Group 9). Follows analysis_plan.md steps 6–11.
+(BME 411, Group 9). Follows analysis_plan.md steps 6-11.
 
 Problem (project proposal):
     minimize   f(X) = W1 · E(X) + W2 · N
@@ -18,7 +18,7 @@ The strict "<" in the overlap constraint is enforced with a small clearance:
 centre distance >= 2r + MIN_GAP_CM.
 
 Run:
-    python optimize.py            # full run (~10–15 min on 10 cores)
+    python optimize.py            # full run (~10-15 min on 10 cores)
     python optimize.py --quick    # smoke test (~1 min)
 
 Outputs (results/):
@@ -130,7 +130,9 @@ class Geometry:
         (xlo, xhi), (ylo, yhi) = ds.bounds
         self.lo = np.array([xlo, ylo])
         self.hi = np.array([xhi, yhi])
-        self.r = ds.sensor_radius_cm
+        self.r = float(ds.sensor_radius_cm)
+        self.r_active = float(getattr(ds, "active_radius_cm", self.r))
+        self.r_dataset = float(getattr(ds, "dataset_radius_cm", D.SENSOR_RADIUS_CM))
         self.dmin = 2.0 * self.r + MIN_GAP_CM
 
     def clamp(self, xy: np.ndarray) -> np.ndarray:
@@ -604,9 +606,13 @@ def plot_layouts(path: Path, ds: D.InsoleDataset, layouts: Dict[int, np.ndarray]
                                edgecolor=INK2, linewidth=0.7, linestyle=":"))
         ax.scatter(ds.sensor_xy_left[:, 0], ds.sensor_xy_left[:, 1], marker="+", s=14,
                    color=INK2, linewidth=0.7, zorder=3)
+        r_act = float(getattr(ds, "active_radius_cm", r))
         for x, y in layouts[n]:
-            ax.add_patch(Circle((x, y), r, facecolor=ORANGE, alpha=0.85,
+            ax.add_patch(Circle((x, y), r, facecolor=ORANGE, alpha=0.55,
                                 edgecolor="white", linewidth=1.5, zorder=4))
+            if abs(r_act - r) > 1e-6:
+                ax.add_patch(Circle((x, y), r_act, facecolor=ORANGE, alpha=0.90,
+                                    edgecolor=INK, linestyle="--", linewidth=0.8, zorder=5))
         chk = D.check_constraints(layouts[n], w, l, r)
         ax.set_title(f"N = {n}\nE = {best[n]:.1f} ms", fontsize=10, color=INK)
         ax.text(0.5, -0.06, f"min edge gap {10 * (chk['min_center_dist_cm'] - 2 * r):.2f} mm\n"
@@ -624,8 +630,9 @@ def plot_layouts(path: Path, ds: D.InsoleDataset, layouts: Dict[int, np.ndarray]
     cbar.set_label("Mean NP pressure (ADC counts)", fontsize=8, color=INK2)
     cbar.ax.tick_params(labelsize=7, colors=INK2)
     cbar.outline.set_visible(False)
-    fig.suptitle("Optimal layouts (orange = sensor, radius r; + = 32 real sensors; "
-                 "dotted box = r ≤ x ≤ w−r, r ≤ y ≤ l−r)", fontsize=9, color=INK2, y=0.99)
+    fig.suptitle("Optimal layouts (orange outer = housing radius r_outer, dashed inner = active r_active; "
+                 "+ = 32 real sensors; dotted box = r_outer ≤ x ≤ w−r_outer, r_outer ≤ y ≤ l−r_outer)",
+                 fontsize=8.5, color=INK2, y=0.99)
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
 
@@ -712,7 +719,10 @@ def main() -> None:
     geom = Geometry(ds)
     train = ds.get_trials_by_pace(TRAIN_PACE)
     log(f"Config: {cfg} | workers={args.workers}")
-    log(f"Insole w={ds.width_cm:.3f} cm, l={ds.length_cm:.3f} cm, r={ds.sensor_radius_cm:.3f} cm; "
+    log(f"Insole w={ds.width_cm:.3f} cm, l={ds.length_cm:.3f} cm, "
+        f"r_outer={geom.r:.3f} cm (D={20*geom.r:.2f} mm), "
+        f"r_active={geom.r_active:.3f} cm (D={20*geom.r_active:.2f} mm), "
+        f"r_dataset={geom.r_dataset:.3f} cm; "
         f"training on {len(train)} {TRAIN_PACE} trials "
         f"({len({t.patient_id for t in train})} participants)")
 
@@ -768,8 +778,11 @@ def main() -> None:
     cross_df = cross_cadence(ds, eval_layouts)
     cross_df["on_pareto_front"] = cross_df["N"].isin(front) & cross_df["layout"].str.startswith("MOPSO")
     cross_df["is_elbow"] = cross_df["layout"] == f"MOPSO N={knee}"
-    baseline_E = float(cross_df.query("layout.str.startswith('All 32') and pace == @TRAIN_PACE",
-                                      engine="python")["E_mean_ms"].iloc[0])
+    if hasattr(D, "score_raw_baseline"):
+        baseline_E = float(D.score_raw_baseline(ds, trials=train)["E_ms"])
+    else:
+        baseline_E = float(cross_df.query("layout.str.startswith('All 32') and pace == @TRAIN_PACE",
+                                          engine="python")["E_mean_ms"].iloc[0])
 
     # ---- Step 11: exports ------------------------------------------------------
     cross_df.to_csv(out / "cross_cadence_validation.csv", index=False, float_format="%.3f")
@@ -807,7 +820,8 @@ def main() -> None:
     with open(out / "optimal_layouts.json", "w") as fh:
         json.dump({"units": "cm, left-insole frame (x: 0..w, y: 0=heel..l)",
                    "width_cm": ds.width_cm, "length_cm": ds.length_cm,
-                   "sensor_radius_cm": ds.sensor_radius_cm, "elbow_N": knee, "pareto_front_N": front,
+                   "sensor_radius_cm": ds.sensor_radius_cm, "active_radius_cm": geom.r_active,
+                   "dataset_radius_cm": geom.r_dataset, "elbow_N": knee, "pareto_front_N": front,
                    "layouts": {str(n): {"E_ms": best[n], "xy": layouts[n].round(4).tolist()}
                                for n in sorted(layouts)}}, fh, indent=2)
 
