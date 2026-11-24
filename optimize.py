@@ -17,13 +17,20 @@ Constraints are HARD: no penalty terms are ever added to E.
 The strict "<" in the overlap constraint is enforced with a small clearance:
 centre distance >= 2r + MIN_GAP_CM.
 
-Run:
-    python optimize.py            # full run (~10–15 min on 10 cores)
-    python optimize.py --quick    # smoke test (~1 min)
+Two gait-event detection methods are optimized side by side (data.py):
+  * "sum"        — sum all N sensor pressures, threshold the total (original plan).
+  * "first_last" — heel-strike = first sensor to load, toe-off = last to unload.
 
-Outputs (results/):
-    pareto_front.png, optimal_layouts.png, convergence_comparison.png,
-    cross_cadence_validation.csv, plus supporting CSV/JSON tables.
+Run:
+    python optimize.py                          # full run, both methods (~25–30 min, 10 cores)
+    python optimize.py --quick                  # smoke test (~2 min)
+    python optimize.py --aggregation first_last # one method only
+
+Outputs:
+    results/sum/  and  results/first_last/  each contain
+        pareto_front.png, optimal_layouts.png, convergence_comparison.png,
+        cross_cadence_validation.csv, plus supporting CSV/JSON tables.
+    results/  method_comparison.png and combined *_all_methods.csv tables.
 """
 
 from __future__ import annotations
@@ -71,6 +78,11 @@ SLSQP_NS: Tuple[int, ...] = (4, 6)
 # Weight sweep: W1 = 1 per ms, W2 = "ms of error one extra sensor is worth"
 W2_VALUES: Tuple[float, ...] = (0.0, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0)
 
+METHOD_LABELS = {
+    "sum": "Summed signal",
+    "first_last": "First/last sensor",
+}
+
 # Colors (validated reference palette, light mode)
 BLUE, ORANGE, AQUA = "#2a78d6", "#eb6834", "#1baf7a"
 INK, INK2, MUTED = "#0b0b0b", "#52514e", "#a3a29d"
@@ -101,25 +113,28 @@ def _init_worker() -> None:
     _TRAIN = _DS.get_trials_by_pace(TRAIN_PACE)
 
 
-def _eval_E(xy_flat: np.ndarray) -> float:
-    """E(X) in ms, mean over training trials. No penalty terms."""
+def _eval_E(job: Tuple[str, np.ndarray]) -> float:
+    """E(X) in ms, mean over training trials. No penalty terms. job = (aggregation, xy_flat)."""
+    aggregation, xy_flat = job
     xy = np.asarray(xy_flat, dtype=np.float64).reshape(-1, 2)
-    return D.score_layout(xy, _DS, _TRAIN, include_overlap_penalty=False)
+    return D.score_layout(xy, _DS, _TRAIN, include_overlap_penalty=False,
+                          aggregation=aggregation)
 
 
 class Evaluator:
     """Scores batches of layouts in parallel and counts function evaluations."""
 
-    def __init__(self, pool: Pool, workers: int):
+    def __init__(self, pool: Pool, workers: int, aggregation: str):
         self.pool = pool
         self.workers = workers
+        self.aggregation = aggregation
         self.nfev = 0
 
     def __call__(self, layouts: Sequence[np.ndarray]) -> np.ndarray:
         self.nfev += len(layouts)
         chunk = max(1, len(layouts) // (4 * self.workers))
-        flat = [np.asarray(l, dtype=np.float64).ravel() for l in layouts]
-        return np.asarray(self.pool.map(_eval_E, flat, chunksize=chunk), dtype=np.float64)
+        jobs = [(self.aggregation, np.asarray(l, dtype=np.float64).ravel()) for l in layouts]
+        return np.asarray(self.pool.map(_eval_E, jobs, chunksize=chunk), dtype=np.float64)
 
 
 # =============================================================================
@@ -438,7 +453,7 @@ def run_pso(ev: Evaluator, geom: Geometry, n: int, seed: int, particles: int,
 # =============================================================================
 def _slsqp_job(args: Tuple) -> Dict:
     """Runs inside a worker: one SLSQP start with finite-difference gradients."""
-    n, x0, maxiter, fd_eps, start_id = args
+    n, x0, maxiter, fd_eps, start_id, aggregation = args
     geom = Geometry(_DS)
     nfev = [0]
     cache: Dict[bytes, float] = {}
@@ -448,7 +463,7 @@ def _slsqp_job(args: Tuple) -> Dict:
         key = np.asarray(x, dtype=np.float64).tobytes()
         if key not in cache:
             nfev[0] += 1
-            cache[key] = _eval_E(x)
+            cache[key] = _eval_E((aggregation, x))
         return cache[key]
 
     def callback(xk: np.ndarray) -> None:
@@ -482,9 +497,9 @@ def _slsqp_job(args: Tuple) -> Dict:
 
 
 def run_slsqp(pool: Pool, geom: Geometry, ns: Sequence[int], starts: int,
-              maxiter: int, seed: int, fd_eps: float = 0.05) -> List[Dict]:
+              maxiter: int, seed: int, aggregation: str, fd_eps: float = 0.05) -> List[Dict]:
     rng = np.random.default_rng(seed)
-    jobs = [(n, geom.random_layout(n, rng).ravel(), maxiter, fd_eps, s)
+    jobs = [(n, geom.random_layout(n, rng).ravel(), maxiter, fd_eps, s, aggregation)
             for n in ns for s in range(starts)]
     return pool.map(_slsqp_job, jobs, chunksize=1)
 
@@ -492,7 +507,8 @@ def run_slsqp(pool: Pool, geom: Geometry, ns: Sequence[int], starts: int,
 # =============================================================================
 # 8. Cross-cadence validation — analysis_plan.md step 10
 # =============================================================================
-def cross_cadence(ds: D.InsoleDataset, layouts: Dict[str, np.ndarray]) -> pd.DataFrame:
+def cross_cadence(ds: D.InsoleDataset, layouts: Dict[str, np.ndarray],
+                  aggregation: str) -> pd.DataFrame:
     rows = []
     for name, xy in layouts.items():
         per_pace = {}
@@ -501,11 +517,13 @@ def cross_cadence(ds: D.InsoleDataset, layouts: Dict[str, np.ndarray]) -> pd.Dat
             if not trials:
                 continue
             scores = pd.DataFrame(
-                [{"patient": tr.patient_id, **D.score_trial(xy, tr, ds)} for tr in trials]
+                [{"patient": tr.patient_id, **D.score_trial(xy, tr, ds, aggregation)}
+                 for tr in trials]
             )
             by_pt = scores.groupby("patient")["E_ms"].mean()
             per_pace[pace] = float(scores["E_ms"].mean())
             rows.append({
+                "aggregation": aggregation,
                 "layout": name,
                 "N": len(xy),
                 "pace": pace,
@@ -537,7 +555,8 @@ def _style(ax) -> None:
 
 
 def plot_pareto(path: Path, best: Dict[int, float], seed_bests: List[Dict[int, float]],
-                sweep: Optional[Dict[int, float]], baseline_E: float, knee: int) -> None:
+                sweep: Optional[Dict[int, float]], baseline_E: float, knee: int,
+                method: str) -> None:
     fig, ax = plt.subplots(figsize=(7.5, 4.6), dpi=200)
     _style(ax)
     ns = sorted(best)
@@ -577,7 +596,7 @@ def plot_pareto(path: Path, best: Dict[int, float], seed_bests: List[Dict[int, f
     ax.set_ylim(bottom=0)
     ax.set_xlabel("Number of sensors, N", color=INK2)
     ax.set_ylabel("Gait-timing RMSE, E (ms)", color=INK2)
-    ax.set_title("Accuracy vs. sensor count (trained on Normal Pace)",
+    ax.set_title(f"Accuracy vs. sensor count — {method} (trained on Normal Pace)",
                  loc="left", fontsize=11, color=INK)
     ax.legend(frameon=False, fontsize=8, loc="upper right", bbox_to_anchor=(0.86, 1.0))
     fig.tight_layout()
@@ -586,7 +605,7 @@ def plot_pareto(path: Path, best: Dict[int, float], seed_bests: List[Dict[int, f
 
 
 def plot_layouts(path: Path, ds: D.InsoleDataset, layouts: Dict[int, np.ndarray],
-                 best: Dict[int, float], geom: Geometry) -> None:
+                 best: Dict[int, float], geom: Geometry, method: str) -> None:
     ns = [n for n in PLOT_NS if n in layouts]
     heat = ds.mean_pressure_map(TRAIN_PACE)
     heat = np.ma.masked_where(~ds.insole_mask, heat)
@@ -624,14 +643,14 @@ def plot_layouts(path: Path, ds: D.InsoleDataset, layouts: Dict[int, np.ndarray]
     cbar.set_label("Mean NP pressure (ADC counts)", fontsize=8, color=INK2)
     cbar.ax.tick_params(labelsize=7, colors=INK2)
     cbar.outline.set_visible(False)
-    fig.suptitle("Optimal layouts (orange = sensor, radius r; + = 32 real sensors; "
+    fig.suptitle(f"Optimal layouts — {method}\n(orange = sensor, radius r; + = 32 real sensors; "
                  "dotted box = r ≤ x ≤ w−r, r ≤ y ≤ l−r)", fontsize=9, color=INK2, y=0.99)
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
 
 
 def plot_convergence(path: Path, mopso_runs: List[Dict], pso: Dict[int, Dict],
-                     slsqp: List[Dict]) -> None:
+                     slsqp: List[Dict], method: str) -> None:
     ns = list(SLSQP_NS)
     fig, axes = plt.subplots(1, len(ns) + 1, figsize=(5.0 * (len(ns) + 1), 4.3), dpi=200)
 
@@ -674,6 +693,37 @@ def plot_convergence(path: Path, mopso_runs: List[Dict], pso: Dict[int, Dict],
     ax.set_title("MOPSO front quality", loc="left", fontsize=11, color=INK)
     ax.legend(frameon=False, fontsize=7.5, loc="lower right")
 
+    fig.suptitle(f"Convergence — {method}", fontsize=11, color=INK, x=0.01, ha="left")
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def plot_method_comparison(path: Path, summaries: Dict[str, Dict]) -> None:
+    """Both detection methods' best-E-per-N curves and 32-sensor references."""
+    fig, ax = plt.subplots(figsize=(7.5, 4.6), dpi=200)
+    _style(ax)
+    for agg, col in zip(summaries, (BLUE, ORANGE)):
+        sm = summaries[agg]
+        best, front = sm["best"], set(sm["front"])
+        ns = sorted(best)
+        ax.plot(ns, [best[n] for n in ns], color=col, linewidth=2, label=METHOD_LABELS[agg])
+        ax.scatter([n for n in ns if n in front], [best[n] for n in ns if n in front],
+                   s=40, color=col, edgecolor="white", linewidth=1.5, zorder=4)
+        dom = [n for n in ns if n not in front]
+        ax.scatter(dom, [best[n] for n in dom], s=40, facecolor="white", edgecolor=col,
+                   linewidth=1.5, zorder=4)
+        ax.axhline(sm["baseline_E"], color=col, linewidth=1, linestyle=":")
+        ax.text(D.N_MAX + 0.3, sm["baseline_E"], f"32 real sensors\n{sm['baseline_E']:.1f} ms",
+                color=INK2, fontsize=7.5, va="center")
+    ax.set_xticks(list(N_RANGE))
+    ax.set_xlim(D.N_MIN - 0.5, D.N_MAX + 2.8)
+    ax.set_ylim(bottom=0)
+    ax.set_xlabel("Number of sensors, N", color=INK2)
+    ax.set_ylabel("Gait-timing RMSE, E (ms)", color=INK2)
+    ax.set_title("Detection method comparison (filled = Pareto front, hollow = dominated)",
+                 loc="left", fontsize=10, color=INK)
+    ax.legend(frameon=False, fontsize=8, loc="lower right", bbox_to_anchor=(0.86, 0.0))
     fig.tight_layout()
     fig.savefig(path)
     plt.close(fig)
@@ -682,94 +732,66 @@ def plot_convergence(path: Path, mopso_runs: List[Dict], pso: Dict[int, Dict],
 # =============================================================================
 # 10. Main pipeline
 # =============================================================================
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
-    ap.add_argument("--quick", action="store_true", help="tiny budgets for a smoke test")
-    ap.add_argument("--seeds", type=int, help="number of independent MOPSO runs")
-    ap.add_argument("--particles", type=int)
-    ap.add_argument("--iters", type=int)
-    ap.add_argument("--slsqp-starts", type=int)
-    ap.add_argument("--skip-sweep", action="store_true", help="skip the PSO-per-N check")
-    ap.add_argument("--workers", type=int, default=os.cpu_count())
-    ap.add_argument("--out", type=Path, default=RESULTS_DIR)
-    args = ap.parse_args()
-
-    cfg = dict(PRESETS["quick" if args.quick else "full"])
-    for k in ("seeds", "particles", "iters", "slsqp_starts"):
-        if getattr(args, k) is not None:
-            cfg[k] = getattr(args, k)
-    out: Path = args.out
+def run_method(agg: str, pool: Pool, workers: int, cfg: Dict, skip_sweep: bool,
+               ds: D.InsoleDataset, geom: Geometry, out: Path, log) -> Dict:
+    """Full analysis_plan.md steps 6–11 for one detection method; outputs in `out`."""
+    method = METHOD_LABELS[agg]
     out.mkdir(parents=True, exist_ok=True)
+    log(f"\n######## Detection method: {method} ('{agg}') ########")
+    ev = Evaluator(pool, workers, agg)
 
-    t_start = time.perf_counter()
-    log_lines: List[str] = []
-
-    def log(msg: str) -> None:
-        print(msg, flush=True)
-        log_lines.append(msg)
-
-    ds = D.load_cached_dataset()
-    geom = Geometry(ds)
-    train = ds.get_trials_by_pace(TRAIN_PACE)
-    log(f"Config: {cfg} | workers={args.workers}")
-    log(f"Insole w={ds.width_cm:.3f} cm, l={ds.length_cm:.3f} cm, r={ds.sensor_radius_cm:.3f} cm; "
-        f"training on {len(train)} {TRAIN_PACE} trials "
-        f"({len({t.patient_id for t in train})} participants)")
-
-    with Pool(args.workers, initializer=_init_worker) as pool:
-        ev = Evaluator(pool, args.workers)
-
-        # ---- Step 6: MOPSO, several seeds --------------------------------------
-        mopso_runs = []
-        for s in range(cfg["seeds"]):
-            t0 = time.perf_counter()
-            run = run_mopso(ev, geom, seed=s, particles=cfg["particles"], iters=cfg["iters"], log=log)
-            run["runtime_s"] = time.perf_counter() - t0
-            mopso_runs.append(run)
-            log(f"MOPSO seed {s}: {run['nfev']} evals in {run['runtime_s']:.1f} s")
-
-        # Combine seeds: best layout per N across all runs
-        best: Dict[int, float] = {}
-        layouts: Dict[int, np.ndarray] = {}
-        for run in mopso_runs:
-            for n, e in run["best_E"].items():
-                if n not in best or e < best[n]:
-                    best[n], layouts[n] = e, run["layouts"][n]
-        front = pareto_front(best)
-        knee = knee_point(front, best)
-
-        # ---- Step 7: PSO sweep check ------------------------------------------
-        pso: Dict[int, Dict] = {}
-        if not args.skip_sweep:
-            t0 = time.perf_counter()
-            for n in N_RANGE:
-                pso[n] = run_pso(ev, geom, n, seed=100 + n,
-                                 particles=cfg["sweep_particles"], iters=cfg["sweep_iters"])
-                log(f"  PSO N={n:2d}: E={pso[n]['E']:.2f} ms  (MOPSO {best.get(n, np.nan):.2f})")
-            log(f"PSO sweep done in {time.perf_counter() - t0:.1f} s")
-
-        # ---- Step 8: multi-start SLSQP ----------------------------------------
+    # ---- Step 6: MOPSO, several seeds ------------------------------------------
+    mopso_runs = []
+    for s in range(cfg["seeds"]):
         t0 = time.perf_counter()
-        slsqp = run_slsqp(pool, geom, SLSQP_NS, cfg["slsqp_starts"], cfg["slsqp_maxiter"], seed=7)
-        log(f"SLSQP: {len(slsqp)} starts in {time.perf_counter() - t0:.1f} s")
+        run = run_mopso(ev, geom, seed=s, particles=cfg["particles"], iters=cfg["iters"], log=log)
+        run["runtime_s"] = time.perf_counter() - t0
+        mopso_runs.append(run)
+        log(f"MOPSO seed {s}: {run['nfev']} evals in {run['runtime_s']:.1f} s")
 
-    # ---- Step 9: pick the optimum (weight sweep + elbow) ----------------------
+    # Combine seeds: best layout per N across all runs
+    best: Dict[int, float] = {}
+    layouts: Dict[int, np.ndarray] = {}
+    for run in mopso_runs:
+        for n, e in run["best_E"].items():
+            if n not in best or e < best[n]:
+                best[n], layouts[n] = e, run["layouts"][n]
+    front = pareto_front(best)
+    knee = knee_point(front, best)
+
+    # ---- Step 7: PSO sweep check -----------------------------------------------
+    pso: Dict[int, Dict] = {}
+    if not skip_sweep:
+        t0 = time.perf_counter()
+        for n in N_RANGE:
+            pso[n] = run_pso(ev, geom, n, seed=100 + n,
+                             particles=cfg["sweep_particles"], iters=cfg["sweep_iters"])
+            log(f"  PSO N={n:2d}: E={pso[n]['E']:.2f} ms  (MOPSO {best.get(n, np.nan):.2f})")
+        log(f"PSO sweep done in {time.perf_counter() - t0:.1f} s")
+
+    # ---- Step 8: multi-start SLSQP ---------------------------------------------
+    t0 = time.perf_counter()
+    slsqp = run_slsqp(pool, geom, SLSQP_NS, cfg["slsqp_starts"], cfg["slsqp_maxiter"],
+                      seed=7, aggregation=agg)
+    log(f"SLSQP: {len(slsqp)} starts in {time.perf_counter() - t0:.1f} s")
+
+    # ---- Step 9: pick the optimum (weight sweep + elbow) -----------------------
     weight_rows = []
     for w2 in W2_VALUES:
         f = {n: 1.0 * best[n] + w2 * n for n in front}
         n_star = min(f, key=f.get)
-        weight_rows.append({"W1": 1.0, "W2_ms_per_sensor": w2, "N_star": n_star,
-                            "E_star_ms": best[n_star], "f_star": f[n_star]})
+        weight_rows.append({"aggregation": agg, "W1": 1.0, "W2_ms_per_sensor": w2,
+                            "N_star": n_star, "E_star_ms": best[n_star], "f_star": f[n_star]})
     weights_df = pd.DataFrame(weight_rows)
 
-    # ---- Step 10: cross-cadence validation ------------------------------------
+    # ---- Step 10: cross-cadence validation -------------------------------------
     eval_layouts = {f"MOPSO N={n}": layouts[n] for n in sorted(layouts)}
     eval_layouts["All 32 real sensors (reference)"] = ds.sensor_xy_left
-    cross_df = cross_cadence(ds, eval_layouts)
+    cross_df = cross_cadence(ds, eval_layouts, agg)
     cross_df["on_pareto_front"] = cross_df["N"].isin(front) & cross_df["layout"].str.startswith("MOPSO")
     cross_df["is_elbow"] = cross_df["layout"] == f"MOPSO N={knee}"
-    baseline_E = float(cross_df.query("layout.str.startswith('All 32') and pace == @TRAIN_PACE",
-                                      engine="python")["E_mean_ms"].iloc[0])
+    ref = cross_df[cross_df["layout"].str.startswith("All 32") & (cross_df["pace"] == TRAIN_PACE)]
+    baseline_E = float(ref["E_mean_ms"].iloc[0])
 
     # ---- Step 11: exports ------------------------------------------------------
     cross_df.to_csv(out / "cross_cadence_validation.csv", index=False, float_format="%.3f")
@@ -780,14 +802,17 @@ def main() -> None:
         chk = D.check_constraints(layouts[n], ds.width_cm, ds.length_cm, ds.sensor_radius_cm)
         seed_es = [r["best_E"].get(n, np.nan) for r in mopso_runs]
         front_rows.append({
-            "N": n, "E_ms": best[n], "on_pareto_front": n in front, "is_elbow": n == knee,
+            "aggregation": agg, "N": n, "E_ms": best[n], "on_pareto_front": n in front,
+            "is_elbow": n == knee,
             "E_seed_min_ms": np.nanmin(seed_es), "E_seed_max_ms": np.nanmax(seed_es),
             "PSO_check_E_ms": pso[n]["E"] if n in pso else np.nan,
             "feasible": chk["feasible"], "min_center_dist_cm": chk["min_center_dist_cm"],
         })
-    pd.DataFrame(front_rows).to_csv(out / "mopso_front.csv", index=False, float_format="%.3f")
+    front_df = pd.DataFrame(front_rows)
+    front_df.to_csv(out / "mopso_front.csv", index=False, float_format="%.3f")
 
     slsqp_df = pd.DataFrame([{k: v for k, v in s.items() if k not in ("xy", "history")} for s in slsqp])
+    slsqp_df.insert(0, "aggregation", agg)
     slsqp_df.to_csv(out / "slsqp_runs.csv", index=False, float_format="%.3f")
 
     perf_rows = [{"method": f"MOPSO seed {r['seed']}", "N": "2–16", "nfev": r["nfev"],
@@ -805,19 +830,20 @@ def main() -> None:
     pd.DataFrame(perf_rows).to_csv(out / "algorithm_performance.csv", index=False, float_format="%.3f")
 
     with open(out / "optimal_layouts.json", "w") as fh:
-        json.dump({"units": "cm, left-insole frame (x: 0..w, y: 0=heel..l)",
+        json.dump({"aggregation": agg,
+                   "units": "cm, left-insole frame (x: 0..w, y: 0=heel..l)",
                    "width_cm": ds.width_cm, "length_cm": ds.length_cm,
                    "sensor_radius_cm": ds.sensor_radius_cm, "elbow_N": knee, "pareto_front_N": front,
                    "layouts": {str(n): {"E_ms": best[n], "xy": layouts[n].round(4).tolist()}
                                for n in sorted(layouts)}}, fh, indent=2)
 
     plot_pareto(out / "pareto_front.png", best, [r["best_E"] for r in mopso_runs],
-                {n: p["E"] for n, p in pso.items()}, baseline_E, knee)
-    plot_layouts(out / "optimal_layouts.png", ds, layouts, best, geom)
-    plot_convergence(out / "convergence_comparison.png", mopso_runs, pso, slsqp)
+                {n: p["E"] for n, p in pso.items()}, baseline_E, knee, method)
+    plot_layouts(out / "optimal_layouts.png", ds, layouts, best, geom, method)
+    plot_convergence(out / "convergence_comparison.png", mopso_runs, pso, slsqp, method)
 
     # ---- Summary ---------------------------------------------------------------
-    log("\n=== Summary ===")
+    log(f"\n=== Summary: {method} ===")
     log(f"Pareto front N: {front} | elbow N* = {knee} (E = {best[knee]:.2f} ms) | "
         f"32-sensor reference E = {baseline_E:.2f} ms")
     log("Weight sweep (W1 = 1, W2 = ms per sensor): " +
@@ -829,6 +855,69 @@ def main() -> None:
             f"feasible {int(sub['feasible'].sum())}/{len(sub)}")
     piv = cross_df.pivot_table(index="layout", columns="pace", values="E_mean_ms", sort=False)
     log("Cross-cadence E (ms):\n" + piv.round(1).to_string())
+
+    return {"best": best, "front": front, "knee": knee, "baseline_E": baseline_E,
+            "front_df": front_df, "cross_df": cross_df, "weights_df": weights_df}
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
+    ap.add_argument("--quick", action="store_true", help="tiny budgets for a smoke test")
+    ap.add_argument("--aggregation", choices=(*D.AGGREGATIONS, "both"), default="both",
+                    help="sensor-combining rule(s) to optimize (default: both)")
+    ap.add_argument("--seeds", type=int, help="number of independent MOPSO runs")
+    ap.add_argument("--particles", type=int)
+    ap.add_argument("--iters", type=int)
+    ap.add_argument("--slsqp-starts", type=int)
+    ap.add_argument("--skip-sweep", action="store_true", help="skip the PSO-per-N check")
+    ap.add_argument("--workers", type=int, default=os.cpu_count())
+    ap.add_argument("--out", type=Path, default=RESULTS_DIR)
+    args = ap.parse_args()
+
+    cfg = dict(PRESETS["quick" if args.quick else "full"])
+    for k in ("seeds", "particles", "iters", "slsqp_starts"):
+        if getattr(args, k) is not None:
+            cfg[k] = getattr(args, k)
+    aggs = list(D.AGGREGATIONS) if args.aggregation == "both" else [args.aggregation]
+    out: Path = args.out
+    out.mkdir(parents=True, exist_ok=True)
+
+    t_start = time.perf_counter()
+    log_lines: List[str] = []
+
+    def log(msg: str) -> None:
+        print(msg, flush=True)
+        log_lines.append(msg)
+
+    ds = D.load_cached_dataset()
+    geom = Geometry(ds)
+    train = ds.get_trials_by_pace(TRAIN_PACE)
+    log(f"Config: {cfg} | methods={aggs} | workers={args.workers}")
+    log(f"Insole w={ds.width_cm:.3f} cm, l={ds.length_cm:.3f} cm, r={ds.sensor_radius_cm:.3f} cm; "
+        f"training on {len(train)} {TRAIN_PACE} trials "
+        f"({len({t.patient_id for t in train})} participants)")
+
+    summaries: Dict[str, Dict] = {}
+    with Pool(args.workers, initializer=_init_worker) as pool:
+        for agg in aggs:
+            summaries[agg] = run_method(agg, pool, args.workers, cfg, args.skip_sweep,
+                                        ds, geom, out / agg, log)
+
+    # ---- Side-by-side comparison of the detection methods -----------------------
+    if len(summaries) > 1:
+        pd.concat([s["front_df"] for s in summaries.values()]).to_csv(
+            out / "method_comparison_front.csv", index=False, float_format="%.3f")
+        pd.concat([s["cross_df"] for s in summaries.values()]).to_csv(
+            out / "cross_cadence_validation_all_methods.csv", index=False, float_format="%.3f")
+        pd.concat([s["weights_df"] for s in summaries.values()]).to_csv(
+            out / "weight_sweep_all_methods.csv", index=False, float_format="%.3f")
+        plot_method_comparison(out / "method_comparison.png", summaries)
+        log("\n=== Method comparison ===")
+        for agg, sm in summaries.items():
+            log(f"{METHOD_LABELS[agg]:>20}: front N={sm['front']}, elbow N*={sm['knee']} "
+                f"(E={sm['best'][sm['knee']]:.2f} ms), best overall E="
+                f"{min(sm['best'].values()):.2f} ms, 32-sensor ref={sm['baseline_E']:.2f} ms")
+
     log(f"Total runtime {time.perf_counter() - t_start:.1f} s. Outputs in {out}")
     (out / "run_log.txt").write_text("\n".join(log_lines) + "\n")
 

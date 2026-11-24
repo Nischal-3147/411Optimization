@@ -77,6 +77,18 @@ MATCH_WINDOW_SEC: float = 0.30         # Max error to match HS/TO event (s)
 MISS_PENALTY_SEC: float = 0.50         # Penalty (500 ms) per missed event
 OVERLAP_LAMBDA: float = 1e4            # Exterior quadratic penalty weight
 
+# How the N virtual sensor signals are combined before HS/TO detection:
+#   "sum"        — add all N pressures into one signal, threshold it (original).
+#   "first_last" — a sensor is "loaded" when it rises above its own resting
+#                  level by FIRST_LAST_THRESH_FRAC of the strongest sensor's
+#                  range; the foot is "in contact" while ANY sensor is loaded,
+#                  so heel-strike = first sensor to load, toe-off = last to unload.
+AGGREGATIONS: Tuple[str, ...] = ("sum", "first_last")
+DEFAULT_AGGREGATION: str = "sum"
+FIRST_LAST_THRESH_FRAC: float = 0.30   # Higher than THRESH_FRAC: single sensors show
+                                       # brief swing-phase spikes (insole flexing in
+                                       # the shoe) that 10% would count as contact
+
 
 # =============================================================================
 # 3. Data Containers
@@ -409,10 +421,21 @@ def sample_virtual_sensors(
     gx: np.ndarray,
     gy: np.ndarray,
 ) -> np.ndarray:
+    """Summed (T,) virtual-insole signal of N continuous sensors."""
+    return sample_virtual_sensor_matrix(P_32, W, sensor_xy, gx, gy).sum(axis=1)
+
+
+def sample_virtual_sensor_matrix(
+    P_32: np.ndarray,
+    W: np.ndarray,
+    sensor_xy: np.ndarray,
+    gx: np.ndarray,
+    gy: np.ndarray,
+) -> np.ndarray:
     """
     Bilinearly interpolate the (NY, NX, 32) weight grid at N continuous sensor
-    positions, apply them to the raw (T, 32) pressures, and return the summed
-    (T,) virtual-insole signal (each virtual sensor clipped at 0).
+    positions, apply them to the raw (T, 32) pressures, and return the per-sensor
+    (T, N) virtual pressures (each clipped at 0).
     """
     ny, nx = W.shape[0], W.shape[1]
     dx = gx[1] - gx[0]
@@ -432,7 +455,43 @@ def sample_virtual_sensors(
         + wy * (1.0 - wx) * W[y0 + 1, x0]
         + wy * wx * W[y0 + 1, x0 + 1]
     )
-    return np.maximum(P_32 @ w_sensors.T, 0.0).sum(axis=1)
+    return np.maximum(P_32 @ w_sensors.T, 0.0)
+
+
+def contact_signal(
+    P_32: np.ndarray,
+    W: np.ndarray,
+    sensor_xy: np.ndarray,
+    gx: np.ndarray,
+    gy: np.ndarray,
+    aggregation: str = DEFAULT_AGGREGATION,
+) -> Tuple[np.ndarray, Optional[float]]:
+    """
+    Combine N virtual sensors into one (T,) contact signal for HS/TO detection.
+    Returns (signal, absolute_threshold); threshold None = detect_hs_to's default.
+
+      "sum":        signal = sum of pressures; threshold = 10% of its p5–p95 range.
+      "first_last": each sensor minus its own resting level (p5), divided by the
+                    strongest sensor's p5–p95 range; signal = max over sensors,
+                    threshold = FIRST_LAST_THRESH_FRAC. The max rises past the
+                    threshold when the FIRST sensor loads and falls below it when
+                    the LAST sensor unloads.
+    """
+    S = sample_virtual_sensor_matrix(P_32, W, sensor_xy, gx, gy)
+    if aggregation == "sum":
+        return S.sum(axis=1), None
+    if aggregation != "first_last":
+        raise ValueError(f"Unknown aggregation '{aggregation}'; choose from {AGGREGATIONS}.")
+
+    lo = np.percentile(S, 5, axis=0)
+    rng = np.percentile(S, 95, axis=0) - lo
+    scale = float(rng.max())
+    if scale < 1e-3:
+        return np.zeros(len(S)), FIRST_LAST_THRESH_FRAC
+    # Common scale (strongest sensor's range) so a weak, never-unloaded sensor's
+    # noise cannot hold the foot "in contact" through swing.
+    norm = (S - lo) / scale
+    return norm.max(axis=1), FIRST_LAST_THRESH_FRAC
 
 
 def detect_hs_to(
@@ -440,14 +499,19 @@ def detect_hs_to(
     signal: np.ndarray,
     thresh_frac: float = THRESH_FRAC,
     min_phase_sec: float = MIN_PHASE_SEC,
+    thresh_abs: Optional[float] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Detect heel-strike (rising) and toe-off (falling) times with sub-sample interpolation."""
+    """
+    Detect heel-strike (rising) and toe-off (falling) times with sub-sample
+    interpolation. Threshold = lo + thresh_frac·(hi − lo) of the signal's p5–p95
+    range, unless an absolute `thresh_abs` is given.
+    """
     lo = float(np.percentile(signal, 5))
     hi = float(np.percentile(signal, 95))
     if hi - lo < 1e-3:
         return np.empty(0), np.empty(0)
 
-    thresh = lo + thresh_frac * (hi - lo)
+    thresh = thresh_abs if thresh_abs is not None else lo + thresh_frac * (hi - lo)
     state = signal >= thresh
 
     # Debounce brief threshold chatter (< min_phase_sec)
@@ -553,14 +617,15 @@ def score_trial(
     sensor_xy: np.ndarray,
     trial: TrialData,
     dataset: InsoleDataset,
+    aggregation: str = DEFAULT_AGGREGATION,
 ) -> Dict[str, float]:
     """Compute HS, TO, Step, Stride RMSEs and combined E(X) (ms) for one trial."""
     gx, gy = dataset.gx, dataset.gy
-    sig_L = sample_virtual_sensors(trial.raw_left, dataset.W_left, sensor_xy, gx, gy)
-    sig_R = sample_virtual_sensors(trial.raw_right, dataset.W_right, sensor_xy, gx, gy)
+    sig_L, th_L = contact_signal(trial.raw_left, dataset.W_left, sensor_xy, gx, gy, aggregation)
+    sig_R, th_R = contact_signal(trial.raw_right, dataset.W_right, sensor_xy, gx, gy, aggregation)
 
-    hs_L, to_L = detect_hs_to(trial.t_left, sig_L)
-    hs_R, to_R = detect_hs_to(trial.t_right, sig_R)
+    hs_L, to_L = detect_hs_to(trial.t_left, sig_L, thresh_abs=th_L)
+    hs_R, to_R = detect_hs_to(trial.t_right, sig_R, thresh_abs=th_R)
 
     gt = trial.ground_truth
     m = len(gt.foot)
@@ -605,18 +670,21 @@ def score_layout(
     sensor_xy: np.ndarray,
     dataset: InsoleDataset,
     trials: Optional[Sequence[TrialData]] = None,
-    include_overlap_penalty: bool = True,
+    include_overlap_penalty: bool = False,
+    aggregation: str = DEFAULT_AGGREGATION,
 ) -> float:
     """
     Main objective entry point for MOPSO, PSO, and SLSQP in optimize.py.
-    Returns mean E(X) (ms) over target trials plus optional overlap penalty.
+    Returns mean E(X) (ms) over target trials. Constraints are enforced as hard
+    constraints by the optimizers, so the overlap penalty is off by default.
+    `aggregation` selects how sensors are combined ("sum" or "first_last").
     """
     sensor_xy = np.asarray(sensor_xy, dtype=np.float64).reshape(-1, 2)
     target_trials = trials if trials is not None else dataset.trials
     if not target_trials:
         raise ValueError("No trials provided to score_layout().")
 
-    e_vals = [score_trial(sensor_xy, tr, dataset)["E_ms"] for tr in target_trials]
+    e_vals = [score_trial(sensor_xy, tr, dataset, aggregation)["E_ms"] for tr in target_trials]
     total = float(np.mean(e_vals))
     if include_overlap_penalty:
         total += overlap_penalty(sensor_xy, sensor_radius_cm=dataset.sensor_radius_cm)
