@@ -52,7 +52,10 @@ import data as D  # noqa: E402
 # =============================================================================
 # 1. Settings
 # =============================================================================
-RESULTS_DIR: Path = D.BASE_DIR / "results"
+RESULTS_SUM_DIR: Path = D.BASE_DIR / "results_sum"
+RESULTS_FIRSTLAST_DIR: Path = D.BASE_DIR / "results_firstlast"
+RESULTS_DIR: Path = RESULTS_SUM_DIR
+EVENT_MODE: str = "sum"                  # "sum" (aggregate) or "firstlast" (heel HS, toe TO)
 TRAIN_PACE: str = "NP"                 # Optimize on Normal Pace only
 TEST_PACES: Tuple[str, ...] = ("NP", "SP", "FP")
 N_RANGE: Tuple[int, ...] = tuple(range(D.N_MIN, D.N_MAX + 1))
@@ -93,19 +96,138 @@ PRESETS = {
 # =============================================================================
 _DS: Optional[D.InsoleDataset] = None
 _TRAIN: Optional[List[D.TrialData]] = None
+_MODE: str = EVENT_MODE
 
 
-def _init_worker() -> None:
-    global _DS, _TRAIN
+def _init_worker(mode: str = EVENT_MODE) -> None:
+    global _DS, _TRAIN, _MODE
+    _MODE = mode
     _DS = D.load_cached_dataset()
     _TRAIN = _DS.get_trials_by_pace(TRAIN_PACE)
+
+
+def _per_sensor_signals(
+    P_32: np.ndarray,
+    W: np.ndarray,
+    sensor_xy: np.ndarray,
+    gx: np.ndarray,
+    gy: np.ndarray,
+) -> np.ndarray:
+    """Return (T, N) non-negative pressure time series for each virtual sensor."""
+    ny, nx = W.shape[0], W.shape[1]
+    dx = gx[1] - gx[0]
+    dy = gy[1] - gy[0]
+
+    ix = np.clip((sensor_xy[:, 0] - gx[0]) / dx, 0.0, nx - 1.0001)
+    iy = np.clip((sensor_xy[:, 1] - gy[0]) / dy, 0.0, ny - 1.0001)
+
+    x0 = ix.astype(np.int32)
+    y0 = iy.astype(np.int32)
+    wx = (ix - x0).astype(np.float32)[:, None]
+    wy = (iy - y0).astype(np.float32)[:, None]
+
+    w_sensors = (
+        (1.0 - wy) * (1.0 - wx) * W[y0, x0]
+        + (1.0 - wy) * wx * W[y0, x0 + 1]
+        + wy * (1.0 - wx) * W[y0 + 1, x0]
+        + wy * wx * W[y0 + 1, x0 + 1]
+    )
+    return np.maximum(P_32 @ w_sensors.T, 0.0)
+
+
+def _heel_toe_signals(
+    sig_tn: np.ndarray,
+    sensor_xy: np.ndarray,
+    length_cm: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Extract heel signal (for HS) and toe/forefoot signal (for TO) from (T, N) sensors."""
+    y = sensor_xy[:, 1]
+    heel_idx = np.where(y <= 0.35 * length_cm)[0]
+    if len(heel_idx) == 0:
+        heel_idx = np.array([int(np.argmin(y))])
+
+    toe_idx = np.where(y >= 0.65 * length_cm)[0]
+    if len(toe_idx) == 0:
+        toe_idx = np.array([int(np.argmax(y))])
+
+    return sig_tn[:, heel_idx].mean(axis=1), sig_tn[:, toe_idx].mean(axis=1)
+
+
+def score_trial_mode(
+    sensor_xy: np.ndarray,
+    trial: D.TrialData,
+    ds: D.InsoleDataset,
+    mode: str = EVENT_MODE,
+) -> Dict[str, float]:
+    """Score one trial using 'sum' (aggregate) or 'firstlast' (heel HS, toe TO)."""
+    if mode == "sum":
+        return D.score_trial(sensor_xy, trial, ds)
+    if mode != "firstlast":
+        raise ValueError(f"Unknown mode: {mode!r}. Expected 'sum' or 'firstlast'.")
+
+    tn_L = _per_sensor_signals(trial.raw_left, ds.W_left, sensor_xy, ds.gx, ds.gy)
+    tn_R = _per_sensor_signals(trial.raw_right, ds.W_right, sensor_xy, ds.gx, ds.gy)
+    heel_L, toe_L = _heel_toe_signals(tn_L, sensor_xy, ds.length_cm)
+    heel_R, toe_R = _heel_toe_signals(tn_R, sensor_xy, ds.length_cm)
+
+    hs_L, _ = D.detect_hs_to(trial.t_left, heel_L)
+    _, to_L = D.detect_hs_to(trial.t_left, toe_L)
+    hs_R, _ = D.detect_hs_to(trial.t_right, heel_R)
+    _, to_R = D.detect_hs_to(trial.t_right, toe_R)
+
+    gt = trial.ground_truth
+    m = len(gt.foot)
+    est_hs = np.full(m, np.nan, dtype=np.float64)
+    hs_errs, to_errs, step_errs, stride_errs = [], [], [], []
+    for i in range(m):
+        h_pool, t_pool = (hs_L, to_L) if gt.foot[i] == 0 else (hs_R, to_R)
+        m_hs, e_hs = D._match_nearest(gt.first_contact[i], h_pool)
+        _, e_to = D._match_nearest(gt.last_contact[i], t_pool)
+        est_hs[i] = m_hs
+        hs_errs.append(e_hs)
+        to_errs.append(e_to)
+
+        if i >= 1 and gt.step_time[i] > 0:
+            est_step = est_hs[i] - est_hs[i - 1]
+            step_errs.append(
+                (est_step - gt.step_time[i]) if np.isfinite(est_step) else D.MISS_PENALTY_SEC
+            )
+        if i >= 2 and gt.stride_time[i] > 0:
+            est_stride = est_hs[i] - est_hs[i - 2]
+            stride_errs.append(
+                (est_stride - gt.stride_time[i]) if np.isfinite(est_stride) else D.MISS_PENALTY_SEC
+            )
+
+    rmse_hs = float(np.sqrt(np.mean(np.square(hs_errs)))) * 1000.0
+    rmse_to = float(np.sqrt(np.mean(np.square(to_errs)))) * 1000.0
+    rmse_step = float(np.sqrt(np.mean(np.square(step_errs)))) * 1000.0 if step_errs else 0.0
+    rmse_stride = float(np.sqrt(np.mean(np.square(stride_errs)))) * 1000.0 if stride_errs else 0.0
+    e_total = float(np.sqrt(0.25 * (rmse_hs**2 + rmse_to**2 + rmse_step**2 + rmse_stride**2)))
+    return {
+        "E_ms": e_total,
+        "HS_ms": rmse_hs,
+        "TO_ms": rmse_to,
+        "Step_ms": rmse_step,
+        "Stride_ms": rmse_stride,
+    }
+
+
+def score_layout_mode(
+    sensor_xy: np.ndarray,
+    ds: D.InsoleDataset,
+    trials: Optional[Sequence[D.TrialData]] = None,
+    mode: str = EVENT_MODE,
+) -> float:
+    target_trials = trials if trials is not None else ds.trials
+    return float(
+        np.mean([score_trial_mode(sensor_xy, tr, ds, mode=mode)["E_ms"] for tr in target_trials])
+    )
 
 
 def _eval_E(xy_flat: np.ndarray) -> float:
     """E(X) in ms, mean over training trials. No penalty terms."""
     xy = np.asarray(xy_flat, dtype=np.float64).reshape(-1, 2)
-    return D.score_layout(xy, _DS, _TRAIN, include_overlap_penalty=False)
-
+    return score_layout_mode(xy, _DS, _TRAIN, mode=_MODE)
 
 class Evaluator:
     """Scores batches of layouts in parallel and counts function evaluations."""
@@ -503,7 +625,7 @@ def cross_cadence(ds: D.InsoleDataset, layouts: Dict[str, np.ndarray]) -> pd.Dat
             if not trials:
                 continue
             scores = pd.DataFrame(
-                [{"patient": tr.patient_id, **D.score_trial(xy, tr, ds)} for tr in trials]
+                [{"patient": tr.patient_id, **score_trial_mode(xy, tr, ds, mode=EVENT_MODE)} for tr in trials]
             )
             by_pt = scores.groupby("patient")["E_ms"].mean()
             per_pace[pace] = float(scores["E_ms"].mean())
@@ -697,9 +819,20 @@ def main() -> None:
     ap.add_argument("--iters", type=int)
     ap.add_argument("--slsqp-starts", type=int)
     ap.add_argument("--skip-sweep", action="store_true", help="skip the PSO-per-N check")
+    ap.add_argument(
+        "--mode",
+        choices=("sum", "firstlast"),
+        default="sum",
+        help="Event detection mode: 'sum' (aggregate -> results_sum) or 'firstlast' (heel/toe -> results_firstlast)",
+    )
     ap.add_argument("--workers", type=int, default=os.cpu_count())
-    ap.add_argument("--out", type=Path, default=RESULTS_DIR)
+    ap.add_argument("--out", type=Path, default=None)
     args = ap.parse_args()
+
+    global EVENT_MODE
+    EVENT_MODE = args.mode
+    if args.out is None:
+        args.out = RESULTS_FIRSTLAST_DIR if args.mode == "firstlast" else RESULTS_SUM_DIR
 
     cfg = dict(PRESETS["quick" if args.quick else "full"])
     for k in ("seeds", "particles", "iters", "slsqp_starts"):
@@ -726,7 +859,7 @@ def main() -> None:
         f"training on {len(train)} {TRAIN_PACE} trials "
         f"({len({t.patient_id for t in train})} participants)")
 
-    with Pool(args.workers, initializer=_init_worker) as pool:
+    with Pool(args.workers, initializer=_init_worker, initargs=(EVENT_MODE,)) as pool:
         ev = Evaluator(pool, args.workers)
 
         # ---- Step 6: MOPSO, several seeds --------------------------------------

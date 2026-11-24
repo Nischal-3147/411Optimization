@@ -1,0 +1,21 @@
+N,start,E0,E_final,nfev,nit,runtime_s,success,message,max_overlap_violation_cm2,max_box_violation_cm,feasible
+4,0,36.157,36.156,20,1,2.372,True,Optimization terminated successfully,0.000,0.000,True
+4,1,68.908,68.562,31,2,4.118,True,Optimization terminated successfully,0.000,0.000,True
+4,2,51.794,9.527,189,13,18.997,True,Optimization terminated successfully,0.000,0.000,True
+4,3,39.430,29.065,262,22,22.910,True,Optimization terminated successfully,0.000,0.000,True
+4,4,20.901,17.902,331,28,26.737,True,Optimization terminated successfully,0.000,0.000,True
+4,5,130.573,24.540,170,15,18.006,True,Optimization terminated successfully,0.000,0.000,True
+4,6,266.182,264.732,31,2,3.059,True,Optimization terminated successfully,0.000,0.000,True
+4,7,82.517,17.185,364,34,28.751,True,Optimization terminated successfully,0.000,0.000,True
+4,8,75.467,34.384,121,11,13.770,True,Optimization terminated successfully,0.000,0.000,True
+4,9,269.743,266.045,98,9,13.792,True,Optimization terminated successfully,0.000,0.000,True
+6,0,36.621,23.438,99,6,11.422,True,Optimization terminated successfully,0.000,0.000,True
+6,1,437.527,437.421,40,2,7.736,True,Optimization terminated successfully,0.000,0.000,True
+6,2,435.197,433.805,98,6,9.647,True,Optimization terminated successfully,0.000,0.000,True
+6,3,28.462,20.631,123,8,13.885,True,Optimization terminated successfully,0.000,0.000,True
+6,4,79.185,78.171,63,3,12.765,True,Optimization terminated successfully,0.000,0.000,True
+6,5,433.063,433.060,63,4,11.106,True,Optimization terminated successfully,0.000,0.000,True
+6,6,87.553,19.816,414,28,28.710,True,Optimization terminated successfully,0.000,0.000,True
+6,7,71.817,53.787,265,16,22.053,True,Optimization terminated successfully,0.000,0.000,True
+6,8,37.799,28.991,354,22,25.738,True,Optimization terminated successfully,0.000,0.000,True
+6,9,9.473,9.254,285,16,20.482,True,Optimization terminated successfully,0.000,0.000,True
