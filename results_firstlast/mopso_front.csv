@@ -1,8 +1,8 @@
 N,E_ms,on_pareto_front,is_elbow,E_seed_min_ms,E_seed_max_ms,PSO_check_E_ms,feasible,min_center_dist_cm
-2,9.380,True,True,9.380,19.226,15.956,True,24.048
-3,9.122,True,False,9.122,17.442,17.078,True,8.145
-4,9.124,False,False,9.124,13.121,9.262,True,7.106
-5,9.124,False,False,9.124,14.307,9.170,True,2.885
+2,9.380,True,True,9.380,18.962,15.956,True,24.048
+3,9.122,True,False,9.122,15.831,17.078,True,8.145
+4,9.124,False,False,9.124,13.432,9.262,True,7.106
+5,9.124,False,False,9.124,14.961,9.170,True,2.885
 6,9.123,False,False,9.123,18.831,10.859,True,1.831
 7,9.124,False,False,9.124,16.016,9.152,True,1.831
 8,9.143,False,False,9.143,17.919,16.941,True,1.831

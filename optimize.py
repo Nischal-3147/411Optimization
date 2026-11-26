@@ -18,10 +18,12 @@ The strict "<" in the overlap constraint is enforced with a small clearance:
 centre distance >= 2r + MIN_GAP_CM.
 
 Run:
-    python optimize.py            # full run (~10-15 min on 10 cores)
-    python optimize.py --quick    # smoke test (~1 min)
+    python optimize.py --mode sum         # -> results_sum/
+    python optimize.py --mode firstlast   # -> results_firstlast/
+    python optimize.py --mode smooth      # -> results_smooth/
+    python optimize.py --quick --mode smooth
 
-Outputs (results/):
+Outputs (results_<mode>/):
     pareto_front.png, optimal_layouts.png, convergence_comparison.png,
     cross_cadence_validation.csv, plus supporting CSV/JSON tables.
 """
@@ -54,13 +56,25 @@ import data as D  # noqa: E402
 # =============================================================================
 RESULTS_SUM_DIR: Path = D.BASE_DIR / "results_sum"
 RESULTS_FIRSTLAST_DIR: Path = D.BASE_DIR / "results_firstlast"
+RESULTS_SMOOTH_DIR: Path = D.BASE_DIR / "results_smooth"
 RESULTS_DIR: Path = RESULTS_SUM_DIR
-EVENT_MODE: str = "sum"                  # "sum" (aggregate) or "firstlast" (heel HS, toe TO)
+
+MODE_DIRS: Dict[str, Path] = {
+    "sum": RESULTS_SUM_DIR,
+    "firstlast": RESULTS_FIRSTLAST_DIR,
+    "smooth": RESULTS_SMOOTH_DIR,
+}
+
+EVENT_MODE: str = "sum"                  # "sum", "firstlast", or "smooth"
 TRAIN_PACE: str = "NP"                 # Optimize on Normal Pace only
 TEST_PACES: Tuple[str, ...] = ("NP", "SP", "FP")
 N_RANGE: Tuple[int, ...] = tuple(range(D.N_MIN, D.N_MAX + 1))
 MIN_GAP_CM: float = 1e-3               # Strict non-overlap clearance (cm)
 E_REF_MS: float = 1000.0 * D.MISS_PENALTY_SEC   # Worst possible E (hypervolume ref)
+
+# Smooth spatial weighting ramp bounds along y in [0, length_cm]
+SMOOTH_HEEL_FULL_FRAC: float = 0.35
+SMOOTH_TOE_FULL_FRAC: float = 0.65
 
 # PSO coefficients (shared by MOPSO and the single-objective PSO sweep)
 W_START, W_END = 0.9, 0.4              # Linearly decreasing inertia
@@ -91,6 +105,13 @@ PRESETS = {
 }
 
 
+def default_results_dir(mode: str) -> Path:
+    """Return the default output directory for a given event mode."""
+    if mode not in MODE_DIRS:
+        raise ValueError(f"Unknown mode: {mode!r}. Expected one of {tuple(MODE_DIRS)}.")
+    return MODE_DIRS[mode]
+
+
 # =============================================================================
 # 2. Parallel objective evaluation (one dataset copy per worker process)
 # =============================================================================
@@ -106,51 +127,57 @@ def _init_worker(mode: str = EVENT_MODE) -> None:
     _TRAIN = _DS.get_trials_by_pace(TRAIN_PACE)
 
 
-def _per_sensor_signals(
-    P_32: np.ndarray,
-    W: np.ndarray,
-    sensor_xy: np.ndarray,
-    gx: np.ndarray,
-    gy: np.ndarray,
-) -> np.ndarray:
-    """Return (T, N) non-negative pressure time series for each virtual sensor."""
-    ny, nx = W.shape[0], W.shape[1]
-    dx = gx[1] - gx[0]
-    dy = gy[1] - gy[0]
-
-    ix = np.clip((sensor_xy[:, 0] - gx[0]) / dx, 0.0, nx - 1.0001)
-    iy = np.clip((sensor_xy[:, 1] - gy[0]) / dy, 0.0, ny - 1.0001)
-
-    x0 = ix.astype(np.int32)
-    y0 = iy.astype(np.int32)
-    wx = (ix - x0).astype(np.float32)[:, None]
-    wy = (iy - y0).astype(np.float32)[:, None]
-
-    w_sensors = (
-        (1.0 - wy) * (1.0 - wx) * W[y0, x0]
-        + (1.0 - wy) * wx * W[y0, x0 + 1]
-        + wy * (1.0 - wx) * W[y0 + 1, x0]
-        + wy * wx * W[y0 + 1, x0 + 1]
-    )
-    return np.maximum(P_32 @ w_sensors.T, 0.0)
-
-
-def _heel_toe_signals(
+def _heel_toe_signals_hard(
     sig_tn: np.ndarray,
     sensor_xy: np.ndarray,
     length_cm: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Extract heel signal (for HS) and toe/forefoot signal (for TO) from (T, N) sensors."""
+    """Hard-band heel signal (for HS) and toe/forefoot signal (for TO) from (T, N) sensors."""
     y = sensor_xy[:, 1]
-    heel_idx = np.where(y <= 0.35 * length_cm)[0]
+    heel_idx = np.where(y <= SMOOTH_HEEL_FULL_FRAC * length_cm)[0]
     if len(heel_idx) == 0:
         heel_idx = np.array([int(np.argmin(y))])
 
-    toe_idx = np.where(y >= 0.65 * length_cm)[0]
+    toe_idx = np.where(y >= SMOOTH_TOE_FULL_FRAC * length_cm)[0]
     if len(toe_idx) == 0:
         toe_idx = np.array([int(np.argmax(y))])
 
     return sig_tn[:, heel_idx].mean(axis=1), sig_tn[:, toe_idx].mean(axis=1)
+
+
+def _heel_toe_signals_smooth(
+    sig_tn: np.ndarray,
+    sensor_xy: np.ndarray,
+    length_cm: float,
+    heel_full_frac: float = SMOOTH_HEEL_FULL_FRAC,
+    toe_full_frac: float = SMOOTH_TOE_FULL_FRAC,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Smooth spatial gradient weighting across heel-to-toe length y in [0, length_cm]:
+      - w_heel(y) = 1 for y <= heel_full_frac * L, 0 for y >= toe_full_frac * L,
+        linearly tapered across the midfoot transition zone.
+      - w_toe(y)  = 1 for y >= toe_full_frac * L, 0 for y <= heel_full_frac * L,
+        linearly tapered across the midfoot transition zone.
+    """
+    y = np.asarray(sensor_xy[:, 1], dtype=np.float64)
+    denom = max(1e-6, (toe_full_frac - heel_full_frac) * length_cm)
+    y_heel_zero = toe_full_frac * length_cm
+    y_toe_zero = heel_full_frac * length_cm
+
+    w_heel = np.clip((y_heel_zero - y) / denom, 0.0, 1.0)
+    w_toe = np.clip((y - y_toe_zero) / denom, 0.0, 1.0)
+
+    # Graceful fallback if all sensors sit beyond zero-weight extremes
+    if float(w_heel.sum()) < 1e-9:
+        w_heel = np.zeros_like(y)
+        w_heel[int(np.argmin(y))] = 1.0
+    if float(w_toe.sum()) < 1e-9:
+        w_toe = np.zeros_like(y)
+        w_toe[int(np.argmax(y))] = 1.0
+
+    heel_sig = (sig_tn @ w_heel.astype(np.float32)) / float(w_heel.sum())
+    toe_sig = (sig_tn @ w_toe.astype(np.float32)) / float(w_toe.sum())
+    return heel_sig, toe_sig
 
 
 def score_trial_mode(
@@ -159,57 +186,30 @@ def score_trial_mode(
     ds: D.InsoleDataset,
     mode: str = EVENT_MODE,
 ) -> Dict[str, float]:
-    """Score one trial using 'sum' (aggregate) or 'firstlast' (heel HS, toe TO)."""
+    """Score one trial using 'sum', 'firstlast' (hard bands), or 'smooth' (graded ramp)."""
     if mode == "sum":
         return D.score_trial(sensor_xy, trial, ds)
-    if mode != "firstlast":
-        raise ValueError(f"Unknown mode: {mode!r}. Expected 'sum' or 'firstlast'.")
+    if mode not in ("firstlast", "smooth"):
+        raise ValueError(
+            f"Unknown mode: {mode!r}. Expected 'sum', 'firstlast', or 'smooth'."
+        )
 
-    tn_L = _per_sensor_signals(trial.raw_left, ds.W_left, sensor_xy, ds.gx, ds.gy)
-    tn_R = _per_sensor_signals(trial.raw_right, ds.W_right, sensor_xy, ds.gx, ds.gy)
-    heel_L, toe_L = _heel_toe_signals(tn_L, sensor_xy, ds.length_cm)
-    heel_R, toe_R = _heel_toe_signals(tn_R, sensor_xy, ds.length_cm)
+    tn_L = D.sample_virtual_sensor_matrix(trial.raw_left, ds.W_left, sensor_xy, ds.gx, ds.gy)
+    tn_R = D.sample_virtual_sensor_matrix(trial.raw_right, ds.W_right, sensor_xy, ds.gx, ds.gy)
+
+    if mode == "firstlast":
+        heel_L, toe_L = _heel_toe_signals_hard(tn_L, sensor_xy, ds.length_cm)
+        heel_R, toe_R = _heel_toe_signals_hard(tn_R, sensor_xy, ds.length_cm)
+    else:
+        heel_L, toe_L = _heel_toe_signals_smooth(tn_L, sensor_xy, ds.length_cm)
+        heel_R, toe_R = _heel_toe_signals_smooth(tn_R, sensor_xy, ds.length_cm)
 
     hs_L, _ = D.detect_hs_to(trial.t_left, heel_L)
     _, to_L = D.detect_hs_to(trial.t_left, toe_L)
     hs_R, _ = D.detect_hs_to(trial.t_right, heel_R)
     _, to_R = D.detect_hs_to(trial.t_right, toe_R)
 
-    gt = trial.ground_truth
-    m = len(gt.foot)
-    est_hs = np.full(m, np.nan, dtype=np.float64)
-    hs_errs, to_errs, step_errs, stride_errs = [], [], [], []
-    for i in range(m):
-        h_pool, t_pool = (hs_L, to_L) if gt.foot[i] == 0 else (hs_R, to_R)
-        m_hs, e_hs = D._match_nearest(gt.first_contact[i], h_pool)
-        _, e_to = D._match_nearest(gt.last_contact[i], t_pool)
-        est_hs[i] = m_hs
-        hs_errs.append(e_hs)
-        to_errs.append(e_to)
-
-        if i >= 1 and gt.step_time[i] > 0:
-            est_step = est_hs[i] - est_hs[i - 1]
-            step_errs.append(
-                (est_step - gt.step_time[i]) if np.isfinite(est_step) else D.MISS_PENALTY_SEC
-            )
-        if i >= 2 and gt.stride_time[i] > 0:
-            est_stride = est_hs[i] - est_hs[i - 2]
-            stride_errs.append(
-                (est_stride - gt.stride_time[i]) if np.isfinite(est_stride) else D.MISS_PENALTY_SEC
-            )
-
-    rmse_hs = float(np.sqrt(np.mean(np.square(hs_errs)))) * 1000.0
-    rmse_to = float(np.sqrt(np.mean(np.square(to_errs)))) * 1000.0
-    rmse_step = float(np.sqrt(np.mean(np.square(step_errs)))) * 1000.0 if step_errs else 0.0
-    rmse_stride = float(np.sqrt(np.mean(np.square(stride_errs)))) * 1000.0 if stride_errs else 0.0
-    e_total = float(np.sqrt(0.25 * (rmse_hs**2 + rmse_to**2 + rmse_step**2 + rmse_stride**2)))
-    return {
-        "E_ms": e_total,
-        "HS_ms": rmse_hs,
-        "TO_ms": rmse_to,
-        "Step_ms": rmse_step,
-        "Stride_ms": rmse_stride,
-    }
+    return D.evaluate_event_pools(hs_L, to_L, hs_R, to_R, trial.ground_truth)
 
 
 def score_layout_mode(
@@ -228,6 +228,7 @@ def _eval_E(xy_flat: np.ndarray) -> float:
     """E(X) in ms, mean over training trials. No penalty terms."""
     xy = np.asarray(xy_flat, dtype=np.float64).reshape(-1, 2)
     return score_layout_mode(xy, _DS, _TRAIN, mode=_MODE)
+
 
 class Evaluator:
     """Scores batches of layouts in parallel and counts function evaluations."""
@@ -616,7 +617,8 @@ def run_slsqp(pool: Pool, geom: Geometry, ns: Sequence[int], starts: int,
 # =============================================================================
 # 8. Cross-cadence validation — analysis_plan.md step 10
 # =============================================================================
-def cross_cadence(ds: D.InsoleDataset, layouts: Dict[str, np.ndarray]) -> pd.DataFrame:
+def cross_cadence(ds: D.InsoleDataset, layouts: Dict[str, np.ndarray],
+                  mode: str = EVENT_MODE) -> pd.DataFrame:
     rows = []
     for name, xy in layouts.items():
         per_pace = {}
@@ -625,7 +627,7 @@ def cross_cadence(ds: D.InsoleDataset, layouts: Dict[str, np.ndarray]) -> pd.Dat
             if not trials:
                 continue
             scores = pd.DataFrame(
-                [{"patient": tr.patient_id, **score_trial_mode(xy, tr, ds, mode=EVENT_MODE)} for tr in trials]
+                [{"patient": tr.patient_id, **score_trial_mode(xy, tr, ds, mode=mode)} for tr in trials]
             )
             by_pt = scores.groupby("patient")["E_ms"].mean()
             per_pace[pace] = float(scores["E_ms"].mean())
@@ -821,18 +823,22 @@ def main() -> None:
     ap.add_argument("--skip-sweep", action="store_true", help="skip the PSO-per-N check")
     ap.add_argument(
         "--mode",
-        choices=("sum", "firstlast"),
+        choices=("sum", "firstlast", "smooth"),
         default="sum",
-        help="Event detection mode: 'sum' (aggregate -> results_sum) or 'firstlast' (heel/toe -> results_firstlast)",
+        help=(
+            "Event detection mode: 'sum' (-> results_sum), "
+            "'firstlast' (-> results_firstlast), or 'smooth' (-> results_smooth)"
+        ),
     )
     ap.add_argument("--workers", type=int, default=os.cpu_count())
     ap.add_argument("--out", type=Path, default=None)
     args = ap.parse_args()
 
-    global EVENT_MODE
+    global EVENT_MODE, RESULTS_DIR
     EVENT_MODE = args.mode
     if args.out is None:
-        args.out = RESULTS_FIRSTLAST_DIR if args.mode == "firstlast" else RESULTS_SUM_DIR
+        args.out = default_results_dir(args.mode)
+    RESULTS_DIR = args.out
 
     cfg = dict(PRESETS["quick" if args.quick else "full"])
     for k in ("seeds", "particles", "iters", "slsqp_starts"):
@@ -851,7 +857,7 @@ def main() -> None:
     ds = D.load_cached_dataset()
     geom = Geometry(ds)
     train = ds.get_trials_by_pace(TRAIN_PACE)
-    log(f"Config: {cfg} | workers={args.workers}")
+    log(f"Mode: {EVENT_MODE} | Config: {cfg} | workers={args.workers}")
     log(f"Insole w={ds.width_cm:.3f} cm, l={ds.length_cm:.3f} cm, "
         f"r_outer={geom.r:.3f} cm (D={20*geom.r:.2f} mm), "
         f"r_active={geom.r_active:.3f} cm (D={20*geom.r_active:.2f} mm), "
@@ -908,7 +914,7 @@ def main() -> None:
     # ---- Step 10: cross-cadence validation ------------------------------------
     eval_layouts = {f"MOPSO N={n}": layouts[n] for n in sorted(layouts)}
     eval_layouts["All 32 real sensors (reference)"] = ds.sensor_xy_left
-    cross_df = cross_cadence(ds, eval_layouts)
+    cross_df = cross_cadence(ds, eval_layouts, mode=EVENT_MODE)
     cross_df["on_pareto_front"] = cross_df["N"].isin(front) & cross_df["layout"].str.startswith("MOPSO")
     cross_df["is_elbow"] = cross_df["layout"] == f"MOPSO N={knee}"
     if hasattr(D, "score_raw_baseline"):
@@ -952,6 +958,7 @@ def main() -> None:
 
     with open(out / "optimal_layouts.json", "w") as fh:
         json.dump({"units": "cm, left-insole frame (x: 0..w, y: 0=heel..l)",
+                   "mode": EVENT_MODE,
                    "width_cm": ds.width_cm, "length_cm": ds.length_cm,
                    "sensor_radius_cm": ds.sensor_radius_cm, "active_radius_cm": geom.r_active,
                    "dataset_radius_cm": geom.r_dataset, "elbow_N": knee, "pareto_front_N": front,

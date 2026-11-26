@@ -84,9 +84,11 @@ GRID_NX: int = 40                      # Medial-lateral grid points
 GRID_NY: int = 80                      # Heel-to-toe grid points
 RBF_SMOOTHING: float = 1e-2            # Thin-plate spline regularization
 
-# Gait-event detection & RMSE scoring hyperparameters
+# Gait-event detection, gait-cycle checks & RMSE scoring hyperparameters
 THRESH_FRAC: float = 0.10              # 10% of [p5, p95] signal range
 MIN_PHASE_SEC: float = 0.12            # Debounce threshold chatter < 120 ms
+MIN_EVENT_GAP_SEC: float = 0.25        # Minimum gap between same-foot crossings (s)
+MAX_STANCE_SEC: float = 3.00           # Upper sanity bound on single stance duration (s)
 MATCH_WINDOW_SEC: float = 0.30         # Max error to match HS/TO event (s)
 MISS_PENALTY_SEC: float = 0.50         # Penalty (500 ms) per missed event
 OVERLAP_LAMBDA: float = 1e4            # Exterior quadratic penalty weight
@@ -464,9 +466,9 @@ def build_rbf_projection(
 
 
 # =============================================================================
-# 7. Virtual Sensor Sampling, Event Detection & Layout Scoring
+# 7. Virtual Sensor Sampling, Gait-Cycle Checks & Layout Scoring
 # =============================================================================
-def sample_virtual_sensors(
+def sample_virtual_sensor_matrix(
     P_32: np.ndarray,
     W: np.ndarray,
     sensor_xy: np.ndarray,
@@ -475,8 +477,7 @@ def sample_virtual_sensors(
 ) -> np.ndarray:
     """
     Bilinearly interpolate the (NY, NX, 32) weight grid at N continuous sensor
-    centers, apply them to the raw (T, 32) pressures, and return the summed
-    (T,) virtual-insole signal (each virtual sensor clipped at 0).
+    centers and return non-negative (T, N) signals for each virtual sensor.
     """
     ny, nx = W.shape[0], W.shape[1]
     dx = gx[1] - gx[0]
@@ -496,7 +497,18 @@ def sample_virtual_sensors(
         + wy * (1.0 - wx) * W[y0 + 1, x0]
         + wy * wx * W[y0 + 1, x0 + 1]
     )
-    return np.maximum(P_32 @ w_sensors.T, 0.0).sum(axis=1)
+    return np.maximum(P_32 @ w_sensors.T, 0.0)
+
+
+def sample_virtual_sensors(
+    P_32: np.ndarray,
+    W: np.ndarray,
+    sensor_xy: np.ndarray,
+    gx: np.ndarray,
+    gy: np.ndarray,
+) -> np.ndarray:
+    """Return the summed (T,) virtual-insole signal across all N sensors."""
+    return sample_virtual_sensor_matrix(P_32, W, sensor_xy, gx, gy).sum(axis=1)
 
 
 def detect_hs_to(
@@ -542,6 +554,54 @@ def detect_hs_to(
     return _interp_crossings(hs_idx), _interp_crossings(to_idx)
 
 
+def sanitize_crossings(
+    times: np.ndarray,
+    min_gap_sec: float = MIN_EVENT_GAP_SEC,
+) -> np.ndarray:
+    """Remove duplicate/chatter crossings closer than min_gap_sec on the same foot."""
+    t_arr = np.sort(np.asarray(times, dtype=np.float64))
+    if len(t_arr) <= 1:
+        return t_arr
+    kept = [float(t_arr[0])]
+    for val in t_arr[1:]:
+        if float(val) - kept[-1] >= min_gap_sec:
+            kept.append(float(val))
+    return np.asarray(kept, dtype=np.float64)
+
+
+def match_stance_pair(
+    true_hs: float,
+    true_to: float,
+    hs_pool: np.ndarray,
+    to_pool: np.ndarray,
+    max_window: float = MATCH_WINDOW_SEC,
+    miss_penalty: float = MISS_PENALTY_SEC,
+    max_stance_sec: float = MAX_STANCE_SEC,
+) -> Tuple[float, float, float, float]:
+    """
+    Match GAITRite HS and TO for a single foot strike while checking gait-cycle
+    ordering (matched TO occurs after matched HS and within max_stance_sec).
+    Returns (matched_hs, hs_err, matched_to, to_err).
+    """
+    m_hs, e_hs = _match_nearest(true_hs, hs_pool, max_window=max_window, miss_penalty=miss_penalty)
+
+    if np.isfinite(m_hs):
+        ordered_to = to_pool[(to_pool > m_hs) & ((to_pool - m_hs) <= max_stance_sec)]
+        candidate_to = ordered_to if len(ordered_to) > 0 else to_pool[to_pool > m_hs]
+    else:
+        candidate_to = to_pool
+
+    m_to, e_to = _match_nearest(true_to, candidate_to, max_window=max_window, miss_penalty=miss_penalty)
+
+    # Final stance-duration check when both events are matched
+    if np.isfinite(m_hs) and np.isfinite(m_to):
+        stance_dt = m_to - m_hs
+        if stance_dt <= 0.0 or stance_dt > max_stance_sec:
+            m_to, e_to = np.nan, miss_penalty
+
+    return m_hs, e_hs, m_to, e_to
+
+
 def _match_nearest(
     true_time: float,
     est_times: np.ndarray,
@@ -558,25 +618,31 @@ def _match_nearest(
     return np.nan, miss_penalty
 
 
-def _evaluate_signals(
-    t_left: np.ndarray,
-    sig_left: np.ndarray,
-    t_right: np.ndarray,
-    sig_right: np.ndarray,
+def evaluate_event_pools(
+    hs_L: np.ndarray,
+    to_L: np.ndarray,
+    hs_R: np.ndarray,
+    to_R: np.ndarray,
     gt: GroundTruth,
 ) -> Dict[str, float]:
-    """Shared scorer comparing left/right summed pressure signals to GAITRite truth."""
-    hs_L, to_L = detect_hs_to(t_left, sig_left)
-    hs_R, to_R = detect_hs_to(t_right, sig_right)
+    """Score detected left/right HS and TO event pools against GAITRite ground truth."""
+    hs_L_c = sanitize_crossings(hs_L)
+    to_L_c = sanitize_crossings(to_L)
+    hs_R_c = sanitize_crossings(hs_R)
+    to_R_c = sanitize_crossings(to_R)
 
     m = len(gt.foot)
     est_hs = np.full(m, np.nan, dtype=np.float64)
     hs_errs, to_errs, step_errs, stride_errs = [], [], [], []
 
     for i in range(m):
-        h_pool, t_pool = (hs_L, to_L) if gt.foot[i] == 0 else (hs_R, to_R)
-        m_hs, e_hs = _match_nearest(gt.first_contact[i], h_pool)
-        _, e_to = _match_nearest(gt.last_contact[i], t_pool)
+        h_pool, t_pool = (hs_L_c, to_L_c) if gt.foot[i] == 0 else (hs_R_c, to_R_c)
+        m_hs, e_hs, _, e_to = match_stance_pair(
+            float(gt.first_contact[i]),
+            float(gt.last_contact[i]),
+            h_pool,
+            t_pool,
+        )
         est_hs[i] = m_hs
         hs_errs.append(e_hs)
         to_errs.append(e_to)
@@ -605,6 +671,19 @@ def _evaluate_signals(
         "Step_ms": rmse_step,
         "Stride_ms": rmse_stride,
     }
+
+
+def _evaluate_signals(
+    t_left: np.ndarray,
+    sig_left: np.ndarray,
+    t_right: np.ndarray,
+    sig_right: np.ndarray,
+    gt: GroundTruth,
+) -> Dict[str, float]:
+    """Shared scorer comparing left/right summed pressure signals to GAITRite truth."""
+    hs_L, to_L = detect_hs_to(t_left, sig_left)
+    hs_R, to_R = detect_hs_to(t_right, sig_right)
+    return evaluate_event_pools(hs_L, to_L, hs_R, to_R, gt)
 
 
 def overlap_penalty(

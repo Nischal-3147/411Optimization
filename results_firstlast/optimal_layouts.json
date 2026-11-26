@@ -1,5 +1,6 @@
 {
   "units": "cm, left-insole frame (x: 0..w, y: 0=heel..l)",
+  "mode": "firstlast",
   "width_cm": 8.933475284895081,
   "length_cm": 27.539521036368168,
   "sensor_radius_cm": 0.915,

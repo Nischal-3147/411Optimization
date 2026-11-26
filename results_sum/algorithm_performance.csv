@@ -1,0 +1,10 @@
+method,N,nfev,runtime_s,best_E_ms
+MOPSO seed 0,2–16,15100.000,114.271,
+MOPSO seed 1,2–16,15100.000,111.755,
+MOPSO seed 2,2–16,15100.000,118.690,
+SLSQP (multi-start),4,1427.000,125.796,10.469
+PSO (single N),4,1830.000,,11.654
+MOPSO (combined seeds),4,,,9.218
+SLSQP (multi-start),6,2384.000,159.356,11.754
+PSO (single N),6,1830.000,,8.888
+MOPSO (combined seeds),6,,,9.114

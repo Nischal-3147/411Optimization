@@ -1,0 +1,78 @@
+Mode: smooth | Config: {'seeds': 3, 'particles': 100, 'iters': 150, 'sweep_particles': 30, 'sweep_iters': 60, 'slsqp_starts': 10, 'slsqp_maxiter': 100} | workers=16
+Insole w=8.933 cm, l=27.540 cm, r_outer=0.915 cm (D=18.30 mm), r_active=0.734 cm (D=14.68 mm), r_dataset=0.840 cm; training on 66 NP trials (22 participants)
+  MOPSO seed 0: iter   15/150  nfev   1600  front N=[2, 8]  HV=7315
+  MOPSO seed 0: iter   30/150  nfev   3100  front N=[2, 6, 8]  HV=7321
+  MOPSO seed 0: iter   45/150  nfev   4600  front N=[2, 5, 6, 8]  HV=7327
+  MOPSO seed 0: iter   60/150  nfev   6100  front N=[2, 5]  HV=7336
+  MOPSO seed 0: iter   75/150  nfev   7600  front N=[2, 5, 6]  HV=7339
+  MOPSO seed 0: iter   90/150  nfev   9100  front N=[2, 5, 6]  HV=7339
+  MOPSO seed 0: iter  105/150  nfev  10600  front N=[2, 5, 6]  HV=7339
+  MOPSO seed 0: iter  120/150  nfev  12100  front N=[2, 5, 6]  HV=7339
+  MOPSO seed 0: iter  135/150  nfev  13600  front N=[2, 5, 6]  HV=7339
+  MOPSO seed 0: iter  150/150  nfev  15100  front N=[2, 5, 6]  HV=7339
+MOPSO seed 0: 15100 evals in 224.2 s
+  MOPSO seed 1: iter   15/150  nfev   1600  front N=[2, 3, 4, 5, 7]  HV=7275
+  MOPSO seed 1: iter   30/150  nfev   3100  front N=[2, 3, 4, 5, 7, 8]  HV=7288
+  MOPSO seed 1: iter   45/150  nfev   4600  front N=[2, 3, 4, 5, 7, 8]  HV=7290
+  MOPSO seed 1: iter   60/150  nfev   6100  front N=[2, 3, 4, 5, 6]  HV=7304
+  MOPSO seed 1: iter   75/150  nfev   7600  front N=[2, 3, 4, 5]  HV=7314
+  MOPSO seed 1: iter   90/150  nfev   9100  front N=[2, 3, 4]  HV=7335
+  MOPSO seed 1: iter  105/150  nfev  10600  front N=[2, 3, 4]  HV=7345
+  MOPSO seed 1: iter  120/150  nfev  12100  front N=[2, 3, 4]  HV=7345
+  MOPSO seed 1: iter  135/150  nfev  13600  front N=[2, 3, 4]  HV=7346
+  MOPSO seed 1: iter  150/150  nfev  15100  front N=[2, 3, 4]  HV=7347
+MOPSO seed 1: 15100 evals in 213.7 s
+  MOPSO seed 2: iter   15/150  nfev   1600  front N=[2, 4, 8]  HV=7291
+  MOPSO seed 2: iter   30/150  nfev   3100  front N=[2, 3, 4, 6, 10]  HV=7315
+  MOPSO seed 2: iter   45/150  nfev   4600  front N=[2, 4, 6, 9]  HV=7318
+  MOPSO seed 2: iter   60/150  nfev   6100  front N=[2, 4, 5, 6, 9]  HV=7318
+  MOPSO seed 2: iter   75/150  nfev   7600  front N=[2, 4, 6, 8]  HV=7320
+  MOPSO seed 2: iter   90/150  nfev   9100  front N=[2, 4, 5]  HV=7326
+  MOPSO seed 2: iter  105/150  nfev  10600  front N=[2, 4, 5, 6]  HV=7334
+  MOPSO seed 2: iter  120/150  nfev  12100  front N=[2, 4, 5, 6]  HV=7335
+  MOPSO seed 2: iter  135/150  nfev  13600  front N=[2, 4, 5, 6]  HV=7336
+  MOPSO seed 2: iter  150/150  nfev  15100  front N=[2, 4, 5]  HV=7337
+MOPSO seed 2: 15100 evals in 238.7 s
+  PSO N= 2: E=12.75 ms  (MOPSO 12.85)
+  PSO N= 3: E=10.69 ms  (MOPSO 9.34)
+  PSO N= 4: E=19.44 ms  (MOPSO 9.32)
+  PSO N= 5: E=9.90 ms  (MOPSO 9.87)
+  PSO N= 6: E=9.08 ms  (MOPSO 9.90)
+  PSO N= 7: E=9.94 ms  (MOPSO 10.61)
+  PSO N= 8: E=9.69 ms  (MOPSO 10.48)
+  PSO N= 9: E=9.77 ms  (MOPSO 10.73)
+  PSO N=10: E=9.89 ms  (MOPSO 10.97)
+  PSO N=11: E=9.61 ms  (MOPSO 11.79)
+  PSO N=12: E=9.22 ms  (MOPSO 11.86)
+  PSO N=13: E=9.75 ms  (MOPSO 12.44)
+  PSO N=14: E=9.29 ms  (MOPSO 16.84)
+  PSO N=15: E=10.01 ms  (MOPSO 14.46)
+  PSO N=16: E=10.05 ms  (MOPSO 16.01)
+PSO sweep done in 474.4 s
+SLSQP: 20 starts in 124.1 s
+
+=== Summary ===
+Pareto front N: [2, 3, 4] | elbow N* = 3 (E = 9.34 ms) | 32-sensor reference E = 18.33 ms
+Weight sweep (W1 = 1, W2 = ms per sensor): W2=0→N*=4, W2=0.5→N*=3, W2=1→N*=3, W2=2→N*=3, W2=5→N*=2, W2=10→N*=2, W2=20→N*=2, W2=50→N*=2
+SLSQP N=4: final E 9.5–41.1 ms over 10 starts (MOPSO 9.3); feasible 10/10
+SLSQP N=6: final E 9.6–46.1 ms over 10 starts (MOPSO 9.9); feasible 10/10
+Cross-cadence E (ms):
+pace                               NP    SP    FP
+layout                                           
+MOPSO N=2                        12.9  37.7  20.5
+MOPSO N=3                         9.3  18.1  14.6
+MOPSO N=4                         9.3  17.9  14.2
+MOPSO N=5                         9.9  21.7  22.1
+MOPSO N=6                         9.9  26.6  13.6
+MOPSO N=7                        10.6  26.2  23.2
+MOPSO N=8                        10.5  28.9  17.1
+MOPSO N=9                        10.7  29.9  16.8
+MOPSO N=10                       11.0  33.7  17.1
+MOPSO N=11                       11.8  30.5  20.9
+MOPSO N=12                       11.9  28.4  14.8
+MOPSO N=13                       12.4  26.6  19.9
+MOPSO N=14                       16.8  35.0  25.1
+MOPSO N=15                       14.5  26.7  18.2
+MOPSO N=16                       16.0  35.1  26.3
+All 32 real sensors (reference)  27.2  33.4  41.0
+Total runtime 1321.9 s. Outputs in /mnt/c/Users/Nischal/OneDrive - University of Waterloo/Documents/UWaterloo/BME term 4A/411Optimization/results_smooth

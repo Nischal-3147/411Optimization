@@ -1,4 +1,4 @@
-Config: {'seeds': 3, 'particles': 100, 'iters': 150, 'sweep_particles': 30, 'sweep_iters': 60, 'slsqp_starts': 10, 'slsqp_maxiter': 100} | workers=16
+Mode: firstlast | Config: {'seeds': 3, 'particles': 100, 'iters': 150, 'sweep_particles': 30, 'sweep_iters': 60, 'slsqp_starts': 10, 'slsqp_maxiter': 100} | workers=16
 Insole w=8.933 cm, l=27.540 cm, r_outer=0.915 cm (D=18.30 mm), r_active=0.734 cm (D=14.68 mm), r_dataset=0.840 cm; training on 66 NP trials (22 participants)
   MOPSO seed 0: iter   15/150  nfev   1600  front N=[2, 5, 6, 7]  HV=7320
   MOPSO seed 0: iter   30/150  nfev   3100  front N=[2, 3, 4, 6, 7]  HV=7351
@@ -10,18 +10,18 @@ Insole w=8.933 cm, l=27.540 cm, r_outer=0.915 cm (D=18.30 mm), r_active=0.734 cm
   MOPSO seed 0: iter  120/150  nfev  12100  front N=[2, 3, 4, 6]  HV=7363
   MOPSO seed 0: iter  135/150  nfev  13600  front N=[2, 3]  HV=7363
   MOPSO seed 0: iter  150/150  nfev  15100  front N=[2, 3]  HV=7363
-MOPSO seed 0: 15100 evals in 94.1 s
+MOPSO seed 0: 15100 evals in 194.4 s
   MOPSO seed 1: iter   15/150  nfev   1600  front N=[2, 4, 5, 7, 10]  HV=7212
   MOPSO seed 1: iter   30/150  nfev   3100  front N=[2, 4]  HV=7256
   MOPSO seed 1: iter   45/150  nfev   4600  front N=[2, 3, 4]  HV=7271
   MOPSO seed 1: iter   60/150  nfev   6100  front N=[2, 3, 4]  HV=7272
-  MOPSO seed 1: iter   75/150  nfev   7600  front N=[2, 3, 4]  HV=7273
-  MOPSO seed 1: iter   90/150  nfev   9100  front N=[2, 3, 4]  HV=7276
-  MOPSO seed 1: iter  105/150  nfev  10600  front N=[2, 3, 4]  HV=7280
-  MOPSO seed 1: iter  120/150  nfev  12100  front N=[2, 3, 4]  HV=7280
-  MOPSO seed 1: iter  135/150  nfev  13600  front N=[2, 3, 4]  HV=7290
-  MOPSO seed 1: iter  150/150  nfev  15100  front N=[2, 3, 4]  HV=7293
-MOPSO seed 1: 15100 evals in 126.9 s
+  MOPSO seed 1: iter   75/150  nfev   7600  front N=[2, 3, 4]  HV=7272
+  MOPSO seed 1: iter   90/150  nfev   9100  front N=[2, 3, 4]  HV=7277
+  MOPSO seed 1: iter  105/150  nfev  10600  front N=[2, 3, 4]  HV=7284
+  MOPSO seed 1: iter  120/150  nfev  12100  front N=[2, 3, 4]  HV=7288
+  MOPSO seed 1: iter  135/150  nfev  13600  front N=[2, 3, 4]  HV=7289
+  MOPSO seed 1: iter  150/150  nfev  15100  front N=[2, 3, 4]  HV=7291
+MOPSO seed 1: 15100 evals in 182.2 s
   MOPSO seed 2: iter   15/150  nfev   1600  front N=[2, 3, 4, 6, 8]  HV=7248
   MOPSO seed 2: iter   30/150  nfev   3100  front N=[2, 3, 4, 5, 6, 7, 9]  HV=7263
   MOPSO seed 2: iter   45/150  nfev   4600  front N=[2, 3, 7, 8, 9]  HV=7284
@@ -32,7 +32,7 @@ MOPSO seed 1: 15100 evals in 126.9 s
   MOPSO seed 2: iter  120/150  nfev  12100  front N=[2, 3, 4]  HV=7328
   MOPSO seed 2: iter  135/150  nfev  13600  front N=[2, 3, 4, 5]  HV=7331
   MOPSO seed 2: iter  150/150  nfev  15100  front N=[2, 3, 4]  HV=7332
-MOPSO seed 2: 15100 evals in 120.5 s
+MOPSO seed 2: 15100 evals in 218.6 s
   PSO N= 2: E=15.96 ms  (MOPSO 9.38)
   PSO N= 3: E=17.08 ms  (MOPSO 9.12)
   PSO N= 4: E=9.26 ms  (MOPSO 9.12)
@@ -48,8 +48,8 @@ MOPSO seed 2: 15100 evals in 120.5 s
   PSO N=14: E=9.24 ms  (MOPSO 20.62)
   PSO N=15: E=10.13 ms  (MOPSO 26.16)
   PSO N=16: E=11.15 ms  (MOPSO 22.48)
-PSO sweep done in 232.7 s
-SLSQP: 20 starts in 31.4 s
+PSO sweep done in 383.9 s
+SLSQP: 20 starts in 44.8 s
 
 === Summary ===
 Pareto front N: [2, 3] | elbow N* = 2 (E = 9.38 ms) | 32-sensor reference E = 18.33 ms
@@ -75,4 +75,4 @@ MOPSO N=14                       20.6  36.1  20.9
 MOPSO N=15                       26.2  40.1  30.1
 MOPSO N=16                       22.5  34.3  27.3
 All 32 real sensors (reference)  37.5  48.3  41.4
-Total runtime 626.3 s. Outputs in /mnt/c/Users/Nischal/OneDrive - University of Waterloo/Documents/UWaterloo/BME term 4A/411Optimization/results_firstlast
+Total runtime 1044.2 s. Outputs in /mnt/c/Users/Nischal/OneDrive - University of Waterloo/Documents/UWaterloo/BME term 4A/411Optimization/results_firstlast
